@@ -9,7 +9,7 @@ Approve commands, answer questions, and send prompts from Telegram, without goin
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![VS Code](https://img.shields.io/badge/VS%20Code-Copilot%20%7C%20Claude%20%7C%20Codex-007ACC?logo=visualstudiocode&logoColor=white)
 ![Telegram](https://img.shields.io/badge/Telegram-bot-26A5E4?logo=telegram&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-102%20passing-2EA44F)
+![Tests](https://img.shields.io/badge/tests-106%20passing-2EA44F)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 
 [Why](#the-problem-it-solves) · [Features](#features) · [How it works](#how-it-works) · [Quick start](#quick-start) · [Using it](#using-it-from-your-phone) · [Security](#security) · [Reliability](#reliability) · [Limitations](#limitations) · [FAQ](#faq)

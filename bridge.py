@@ -1098,6 +1098,9 @@ def field_choices(f: dict) -> tuple[list[str], list[Any], bool, list[int]]:
     """(labels, values, pick-several?, pre-selected indexes) of one question-form field. Handles
     enum/enumNames, oneOf, and array fields (items.enum / items.anyOf / items.oneOf)."""
     items = f.get("items") if isinstance(f.get("items"), dict) else {}
+    if f.get("type") == "boolean" and not f.get("enum") and not f.get("oneOf"):
+        d = f.get("default")
+        return ["Yes", "No"], [True, False], False, ([0] if d is True else [1] if d is False else [])
     multi = f.get("type") == "array" or bool(items)
     consts = f.get("oneOf") or items.get("anyOf") or items.get("oneOf") or []
     vals = f.get("enum") or items.get("enum") or [o.get("const") for o in consts if isinstance(o, dict)]
@@ -1121,19 +1124,24 @@ def question_choices(args: dict) -> tuple[bool, list[int]]:
 
 
 def form_fields(args: dict) -> list[dict]:
-    """Parts of a question form with several fields, each with its own choices (VS Code shows them
-    as pages). [] unless every part has choices, so buttons can answer the whole form."""
-    props = (args.get("requestedSchema") or {}).get("properties") or {}
+    """Parts of a question form with several fields (VS Code shows them as pages). Parts with
+    choices get buttons; free-text parts are filled by typing. [] if no part has choices."""
+    schema = args.get("requestedSchema") or {}
+    props = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
     if len(props) < 2:
         return []
     out = []
     for name, f in props.items():
-        labels, _, multi, picked = field_choices(f if isinstance(f, dict) else {})
-        if not labels:
-            return []
-        out.append({"title": _inline(f.get("title") or name, 80).replace("*", ""), "labels": labels,
-                    "multi": multi, "picked": set(picked if multi else picked[:1])})
-    return out
+        f = f if isinstance(f, dict) else {}
+        labels, _, multi, picked = field_choices(f)
+        title = _inline(f.get("title") or name, 80).replace("*", "")
+        if labels:
+            out.append({"title": title, "labels": labels, "multi": multi,
+                        "picked": set(picked if multi else picked[:1])})
+        else:
+            out.append({"title": title, "text": True, "value": "", "required": name in required})
+    return out if any("labels" in f for f in out) else []
 
 
 def question_card(args: dict, with_options: bool = True) -> tuple[str, str, list[str]]:
@@ -1167,6 +1175,8 @@ def question_card(args: dict, with_options: bool = True) -> tuple[str, str, list
                     line += "".join(f"\n   *{n}{chr(97 + k)}* {_inline(str(x), 80)}" for k, x in enumerate(labels[:26]))
                 else:
                     line += f" ({(' + ' if multi else ' / ').join(_inline(str(x), 40) for x in labels)})"
+            elif not labels and lettered:
+                line += "\n   ✏️ Type it as your reply"
             body.append(line)
         options = []
     else:
@@ -1902,6 +1912,8 @@ class Bridge:
             if form:  # several parts, each with its own choices: tap to choose, then Send
                 rows = []
                 for fi, f in enumerate(form, 1):
+                    if f.get("text"):
+                        continue
                     on, off = ("☑", "☐") if f["multi"] else ("●", "○")
                     for oi, label in enumerate(f["labels"][:12], 1):
                         mark = on if oi - 1 in f["picked"] else off
@@ -1963,17 +1975,30 @@ class Bridge:
         heading, text, options = question_card(args, with_options=not self.transport.supports_buttons)
         qmeta = self.question_meta(args)
         if qmeta.get("form"):
-            footer = ("Tap your choice for each part (defaults are already selected), then *Send answers*. "
-                      "Or type your answer." if self.transport.supports_buttons
-                      else "Reply with a choice for each part, e.g. *1a 2c*, or type your answer.")
+            texts = [f["title"] for f in qmeta["form"] if f.get("text")]
+            if self.transport.supports_buttons:
+                footer = "Tap your choice for each part (defaults are already selected), then *Send answers*."
+                if texts:
+                    footer += (f" To fill in “{texts[0]}”, type it here: that sends everything." if len(texts) == 1
+                               else " Or type a reply to answer the written parts; that sends everything.")
+                else:
+                    footer += " Or type your answer."
+            else:
+                footer = "Reply with a choice for each part, e.g. *1a 2c*, or type your answer."
         else:
             footer = self.question_footer(options, bool(qmeta))
         return heading, self._numbered(text, options), options, qmeta, footer
 
     @staticmethod
     def form_answer(form: list[dict]) -> str:
-        return "\n".join(f"{f['title']}: " + "; ".join(f["labels"][k] for k in sorted(f["picked"]))
-                         for f in form)
+        lines = []
+        for f in form:
+            if f.get("text"):
+                if f.get("value"):
+                    lines.append(f"{f['title']}: {f['value']}")
+            else:
+                lines.append(f"{f['title']}: " + "; ".join(f["labels"][k] for k in sorted(f["picked"])))
+        return "\n".join(lines)
 
     def question_footer(self, options: list[str], multi: bool = False) -> str:
         if multi and options:
@@ -2098,7 +2123,7 @@ class Bridge:
                 m = re.fullmatch(r"f(\d+)\.(\d+)", t)
                 if m:  # a choice button was tapped
                     fi, oi = int(m[1]) - 1, int(m[2]) - 1
-                    if 0 <= fi < len(form) and 0 <= oi < len(form[fi]["labels"]):
+                    if 0 <= fi < len(form) and 0 <= oi < len(form[fi].get("labels") or []):
                         with p.lock:
                             f = form[fi]
                             if f["multi"]:
@@ -2108,25 +2133,32 @@ class Bridge:
                         self._redraw_buttons(p)
                     return
                 codes = re.findall(r"(\d+)\s*([a-z])", t.lower())
+                texts = [f for f in form if f.get("text")]
                 if t.lower() in ("done", "send"):
-                    missing = [str(n) for n, f in enumerate(form, 1) if not f["picked"]]
+                    missing = [str(n) for n, f in enumerate(form, 1)
+                               if (f.get("text") and f.get("required")) or (not f.get("text") and not f["picked"])]
                     if missing:
-                        self.send(f"#{p.id}: choose something for part {', '.join(missing)} first, or type your answer.")
+                        self.send(f"#{p.id}: part {', '.join(missing)} still needs an answer: tap a choice, "
+                                  "or type the written part here.")
                         return
                     result = {"text": self.form_answer(form)}
                 elif codes and re.fullmatch(r"(\s*[,;]?\s*\d+\s*[a-z])+\s*", t.lower()):
-                    chosen = [dict(f, picked=set()) for f in form]
+                    chosen = [dict(f, picked=set()) if not f.get("text") else dict(f) for f in form]
                     ok = True
                     for n, letter in codes:
                         fi, oi = int(n) - 1, ord(letter) - 97
-                        if not (0 <= fi < len(form) and 0 <= oi < len(form[fi]["labels"])):
+                        if not (0 <= fi < len(form) and 0 <= oi < len(form[fi].get("labels") or [])):
                             ok = False
                             break
                         chosen[fi]["picked"] = chosen[fi]["picked"] | {oi} if form[fi]["multi"] else {oi}
                     for fi, f in enumerate(chosen):  # parts not mentioned keep their default
-                        if not f["picked"]:
+                        if not f.get("text") and not f["picked"]:
                             f["picked"] = set(form[fi]["picked"])
                     result = {"text": self.form_answer(chosen)} if ok else {"text": t}
+                elif texts and all(f["picked"] for f in form if not f.get("text")):
+                    # Typed text fills the written part(s); the choices go along as selected.
+                    filled = [dict(f, value=t) if f.get("text") else f for f in form]
+                    result = {"text": self.form_answer(filled)}
                 else:
                     result = {"text": t}  # free-text answer
             elif p.meta.get("multi"):

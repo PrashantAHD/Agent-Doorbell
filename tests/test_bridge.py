@@ -1619,6 +1619,67 @@ class FormTests(Base):
         self.assertIn("wiz-governance-reporter (private repo): Push feature/monthly-governance-deck", reason)
 
 
+class MixedFormTests(Base):
+    """Several-part questions that mix choices with yes/no and free-text parts."""
+
+    YESNO = {"message": "Which direction for an original WizExpert logo?", "requestedSchema": {"properties": {
+        "style": {"type": "string", "title": "Logo concept", "default": "shield-wand",
+                  "oneOf": [{"const": "shield-wand", "title": "Shield + magic wand"},
+                            {"const": "monogram", "title": "Bold WE monogram"}]},
+        "palette": {"type": "string", "title": "Colours", "default": "blue-teal",
+                    "oneOf": [{"const": "blue-teal", "title": "Blue to teal (current)"},
+                              {"const": "indigo-violet", "title": "Indigo to violet"}]},
+        "wordmark": {"type": "boolean", "title": "Include the name inside the logo?", "default": False}}}}
+    NOTES = {"message": "Which one should I polish for the README?", "requestedSchema": {"properties": {
+        "choice": {"type": "string", "title": "Logo concept", "default": "A",
+                   "oneOf": [{"const": "A", "title": "A · Security graph shield"},
+                             {"const": "B", "title": "B · Cloud radar"}]},
+        "notes": {"type": "string", "title": "Any tweaks? (optional)", "description": "e.g. 'A but filled shield'"}}}}
+
+    def start(self, args):
+        tg = FakeTelegram()
+        self.br.transport = tg
+        t, box = run_async(self.br.on_pre_tool, {"sessionId": "s1", "cwd": self.cwd, "toolName": "ask_user",
+                                                 "toolArgs": args})
+        wait_pending(self.br)
+        time.sleep(0.1)
+        return tg, t, box, tg.sent("sendMessage")[0]
+
+    def test_yes_no_part_gets_buttons(self):
+        tg, t, box, msg = self.start(self.YESNO)
+        kb = msg["reply_markup"]["inline_keyboard"]
+        self.assertEqual([r[0]["text"] for r in kb][-3:], ["3a ○ Yes", "3b ● No", "Send answers"])
+        self.br.handle_callback(kb[-3][0]["callback_data"], tg.next_id)   # Yes
+        self.br.handle_callback(kb[-1][0]["callback_data"], tg.next_id)   # Send
+        t.join(3)
+        reason = box["r"]["permissionDecisionReason"]
+        self.assertIn("Logo concept: Shield + magic wand", reason)
+        self.assertIn("Include the name inside the logo?: Yes", reason)
+
+    def test_free_text_part_is_filled_by_typing(self):
+        tg, t, box, msg = self.start(self.NOTES)
+        kb = msg["reply_markup"]["inline_keyboard"]
+        self.assertEqual([r[0]["text"] for r in kb], ["1a ● A · Security graph shield", "1b ○ B · Cloud radar",
+                                                      "Send answers"])
+        self.assertIn("Type it as your reply", msg["text"])
+        self.br.handle_callback(kb[1][0]["callback_data"], tg.next_id)    # pick B
+        self.br.handle_inbound("make it rounder")                         # fills "Any tweaks?" and sends
+        t.join(3)
+        reason = box["r"]["permissionDecisionReason"]
+        self.assertIn("Logo concept: B · Cloud radar", reason)
+        self.assertIn("Any tweaks? (optional): make it rounder", reason)
+
+    def test_send_without_optional_text(self):
+        tg, t, box, msg = self.start(self.NOTES)
+        self.br.handle_callback(msg["reply_markup"]["inline_keyboard"][-1][0]["callback_data"], tg.next_id)
+        t.join(3)
+        self.assertNotIn("Any tweaks", box["r"]["permissionDecisionReason"])
+
+    def test_single_yes_no_question(self):
+        args = {"message": "Push now?", "requestedSchema": {"properties": {"go": {"type": "boolean", "title": "Push now?"}}}}
+        self.assertEqual(B.question_card(args)[2], ["Yes", "No"])
+
+
 class InstallHooksTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
