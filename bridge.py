@@ -1,4 +1,4 @@
-"""Agent Doorbell: answer your VS Code Copilot agents from your phone (Telegram or WhatsApp).
+"""Agent Doorbell: answer your VS Code coding agents from your phone (Telegram).
 
 Runs locally. Copilot hooks (hook.py) POST events here. VS Code always shows its own prompt;
 anything still unanswered after a minute is also sent to your phone, and whichever side
@@ -7,8 +7,7 @@ answers first wins.
 Usage:
     python bridge.py                 run the bridge
     python bridge.py supervise       run the bridge and restart it if it crashes or hangs
-    python bridge.py setup-telegram  pair a Telegram bot (recommended, free)
-    python bridge.py setup           Twilio WhatsApp setup
+    python bridge.py setup-telegram  pair a Telegram bot
     python bridge.py test-send       send a test message to your phone
     python bridge.py install-hooks   write the Copilot (and Claude/Codex) hooks; uninstall-hooks removes them
     python bridge.py health          check that the real bridge is running
@@ -16,7 +15,6 @@ Usage:
 
 from __future__ import annotations
 
-import base64
 import ctypes
 import fnmatch
 import getpass
@@ -53,22 +51,13 @@ COPILOT_HOME = Path(os.environ.get("COPILOT_HOME", Path.home() / ".copilot"))
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 SESSION_STATE = COPILOT_HOME / "session-state"
-WA_MAX = 1550  # Twilio WhatsApp body limit is 1600 chars
 EXT_VERSION = "10"  # must match X-Ext-Version sent by vscode-extension/extension.js
 ATTACH_MAX = 1_000_000  # longest command/diff sent to the phone as a file
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    # "auto" uses Telegram when paired, otherwise Twilio WhatsApp when configured.
-    "provider": "auto",
     "telegram": {
         "bot_token": "",
         "chat_id": "",
-    },
-    "twilio": {
-        "account_sid": "",
-        "auth_token": "",
-        "from": "whatsapp:+14155238886",
-        "to": "",
     },
     "port": 47615,  # unusual on purpose: 8765/8000/8080 are common dev-server ports
     "token": "",
@@ -295,9 +284,9 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
     cfg = dict(DEFAULT_CONFIG)
     if path.exists():
         cfg = _merge(DEFAULT_CONFIG, json.loads(path.read_text(encoding="utf-8")))
-    tw = cfg["twilio"]
-    tw["account_sid"] = os.environ.get("TWILIO_ACCOUNT_SID", tw["account_sid"])
-    tw["auth_token"] = os.environ.get("TWILIO_AUTH_TOKEN", tw["auth_token"])
+    for gone in ("twilio", "provider"):  # WhatsApp support was removed; drop its old settings
+        if cfg.pop(gone, None) is not None and path.exists():
+            save_config(cfg, path)
     cfg["telegram"]["bot_token"] = os.environ.get("TELEGRAM_BOT_TOKEN", cfg["telegram"]["bot_token"])
     if not cfg.get("token"):
         cfg["token"] = secrets.token_urlsafe(24)
@@ -309,13 +298,8 @@ def save_config(cfg: dict, path: Path = CONFIG_PATH) -> None:
     path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
 
-def _wa(number: str) -> str:
-    number = number.strip().replace(" ", "")
-    return number if number.startswith("whatsapp:") else f"whatsapp:{number}"
-
-
 # ----------------------------------------------------------------------------
-# Phone transports. All are polled - no public webhook needed.
+# Phone transport (Telegram, polled - no public webhook needed)
 # ----------------------------------------------------------------------------
 
 Buttons = list[list[tuple[str, str]]]  # rows of (label, reply text)
@@ -372,7 +356,7 @@ def _unmark(s: str) -> str:
 
 
 def to_plain(s: str) -> str:
-    """Message body for channels without rich formatting (WhatsApp, logs): subtitle in _italics_,
+    """Message body without rich formatting (logs, plain-text fallback): subtitle in _italics_,
     collapsed sections as > quotes."""
     s = re.sub(f"{SUB_OPEN}(.*?){SUB_CLOSE}", lambda m: f"_{m.group(1)}_", s, flags=re.S)
     s = re.sub(f"{MORE_OPEN}(.*?){MORE_CLOSE}",
@@ -529,61 +513,6 @@ class TelegramTransport(Transport):
                 if cq.get("data") and cq["data"] != "noop":
                     out.append({"data": cq["data"], "message_id": msg.get("message_id")})
         return out
-
-
-class TwilioTransport(Transport):
-    name = "whatsapp"
-
-    API = "https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
-
-    def __init__(self, sid: str, token: str, from_: str, to: str) -> None:
-        super().__init__()
-        self.sid, self.from_, self.to = sid, _wa(from_), _wa(to)
-        self._auth = "Basic " + base64.b64encode(f"{sid}:{token}".encode()).decode()
-        self._seen: set[str] = set()
-        self._primed = False
-
-    @property
-    def configured(self) -> bool:
-        return True
-
-    def _req(self, method: str, url: str, data: dict | None = None) -> dict:
-        body = urllib.parse.urlencode(data).encode() if data else None
-        req = urllib.request.Request(url, data=body, method=method, headers={"Authorization": self._auth})
-        with urllib.request.urlopen(req, timeout=20, context=SSL_CTX) as r:
-            return json.loads(r.read().decode())
-
-    def send(self, body: str, buttons: Buttons | None = None) -> Any:
-        body = to_plain(body)
-        if len(body) > WA_MAX:
-            body = body[: WA_MAX - 1] + "…"
-        try:
-            self._req("POST", self.API.format(sid=self.sid), {"From": self.from_, "To": self.to, "Body": body})
-            self.last_error = ""
-            return True
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode(errors="replace")
-            self.last_error = f"Twilio {e.code}: {detail[:300]}"
-        except Exception as e:  # network errors
-            self.last_error = f"Twilio send failed: {e}"
-        log.error(self.last_error)
-        return False
-
-    def poll(self) -> list[str]:
-        q = urllib.parse.urlencode({"From": self.to, "To": self.from_, "PageSize": 20})
-        try:
-            data = self._req("GET", self.API.format(sid=self.sid) + "?" + q)
-        except Exception as e:
-            log.warning("Twilio poll failed: %s", e)
-            return []
-        msgs = [m for m in data.get("messages", []) if str(m.get("direction", "")).startswith("inbound")]
-        new = [m for m in msgs if m["sid"] not in self._seen]
-        self._seen.update(m["sid"] for m in msgs)
-        if not self._primed:  # ignore history from before the bridge started
-            self._primed = True
-            return []
-        new.sort(key=lambda m: m.get("date_created") or "")
-        return [m.get("body") or "" for m in new]
 
 
 # ----------------------------------------------------------------------------
@@ -1293,12 +1222,9 @@ def outcome_label(kind: str, result: dict, by: str) -> str:
 
 
 def make_transport(cfg: dict) -> Transport:
-    prov = str(cfg.get("provider", "auto")).lower()
-    tg, tw = cfg.get("telegram") or {}, cfg.get("twilio") or {}
-    if prov in ("auto", "telegram") and tg.get("bot_token") and tg.get("chat_id"):
+    tg = cfg.get("telegram") or {}
+    if tg.get("bot_token") and tg.get("chat_id"):
         return TelegramTransport(tg["bot_token"], tg["chat_id"])
-    if prov in ("auto", "twilio", "whatsapp") and tw.get("account_sid") and tw.get("auth_token") and tw.get("to"):
-        return TwilioTransport(tw["account_sid"], tw["auth_token"], tw["from"], tw["to"])
     return Transport()
 
 
@@ -2062,7 +1988,7 @@ class Bridge:
         return "Reply here to keep going." if self.transport.supports_buttons else "Reply to keep going, or *ok* to end."
 
     def _numbered(self, body: str, options: list[str]) -> str:
-        """Without buttons (WhatsApp), options are listed in the text instead."""
+        """Without buttons (dry-run), options are listed in the text instead."""
         if not options or self.transport.supports_buttons:
             return body
         return (body + "\n\n" if body else "") + "\n".join(f"*{i}.* {_inline(o, 80)}" for i, o in enumerate(options, 1))
@@ -2924,19 +2850,6 @@ def serve(cfg: dict) -> None:
         server.server_close()
 
 
-def setup() -> None:
-    cfg = load_config()
-    tw = cfg["twilio"]
-    print("Twilio WhatsApp setup (values are stored only in", CONFIG_PATH, ")")
-    tw["account_sid"] = input(f"Account SID [{tw['account_sid'] or 'AC...'}]: ").strip() or tw["account_sid"]
-    tok = getpass.getpass("Auth Token (hidden, Enter to keep current): ").strip()
-    tw["auth_token"] = tok or tw["auth_token"]
-    tw["from"] = _wa(input(f"Twilio WhatsApp number [{tw['from']}]: ").strip() or tw["from"])
-    tw["to"] = _wa(input(f"Your WhatsApp number incl. country code, e.g. +9198xxxxxxx [{tw['to']}]: ").strip() or tw["to"])
-    save_config(cfg)
-    print("Saved. Run:  python bridge.py test-send")
-
-
 def setup_telegram() -> None:
     cfg = load_config()
     tg = cfg["telegram"]
@@ -3117,9 +3030,7 @@ def main() -> None:
     if sys.stdout is not None and sys.stdout.isatty():
         handlers.append(logging.StreamHandler())
     logging.basicConfig(level=logging.INFO, handlers=handlers, format="%(asctime)s %(levelname)s %(message)s")
-    if cmd == "setup":
-        setup()
-    elif cmd == "setup-telegram":
+    if cmd in ("setup", "setup-telegram"):
         setup_telegram()
     elif cmd == "supervise":
         supervise(load_config())

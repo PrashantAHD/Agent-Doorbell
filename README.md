@@ -9,7 +9,7 @@ Approve commands, answer questions, and send prompts from Telegram, without goin
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![VS Code](https://img.shields.io/badge/VS%20Code-Copilot%20%7C%20Claude%20%7C%20Codex-007ACC?logo=visualstudiocode&logoColor=white)
 ![Telegram](https://img.shields.io/badge/Telegram-bot-26A5E4?logo=telegram&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-96%20passing-2EA44F)
+![Tests](https://img.shields.io/badge/tests-102%20passing-2EA44F)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 
 [Why](#the-problem-it-solves) · [Features](#features) · [How it works](#how-it-works) · [Quick start](#quick-start) · [Using it](#using-it-from-your-phone) · [Security](#security) · [Reliability](#reliability) · [Limitations](#limitations) · [FAQ](#faq)
@@ -189,25 +189,13 @@ Re-run the installer (`install.ps1` or `install.sh`) after changing settings.
 | `keep_awake` | `true` | Stops the computer from sleeping because of inactivity while the bridge runs. The screen still turns off and locks |
 | `helper_idle_minutes` | `10` | Closes the helper VS Code window the bridge opened after this long without work. It reopens when needed |
 | `notify_turn_end` | `true` | Send "turn finished" cards |
-| `provider` | `auto` | `telegram`, `twilio` (WhatsApp), or `auto` (Telegram if paired) |
 | `passthrough_tools` | list | Tools that never ring the phone |
 | `sensitive_write_globs` | list | Files that always need approval, even inside the workspace |
 | `port` | `47615` | Local port of the bridge (127.0.0.1 only) |
 
-Secrets can also come from the `TELEGRAM_BOT_TOKEN`, `TWILIO_ACCOUNT_SID`, and `TWILIO_AUTH_TOKEN` environment variables.
+The bot token can also come from the `TELEGRAM_BOT_TOKEN` environment variable.
 
 **Advanced / legacy modes:** `turn_hold_minutes` and `questions_via_chat` (experimental: hold finished turns in the hook), `hold_in_hook` (old behaviour: VS Code waits for the phone), and `laptop_popup` with `escalate_after_seconds` (a laptop popup first). All are off by default.
-
-</details>
-
-<details>
-<summary><b>💬 Prefer WhatsApp? (Twilio, paid)</b></summary>
-
-<br>
-
-1. Create a Twilio account and join the WhatsApp sandbox (Console → Messaging → Try it out → *Send a WhatsApp message*).
-2. Run `python bridge.py setup`. If a Telegram bot is also paired, set `"provider": "twilio"`. Then run `install.ps1`.
-3. Costs about $0.005 per message after the trial credit runs out. WhatsApp only lets the bot message you within 24 hours of your last message to it. Buttons aren't available, so you type `1`/`2`/`3` instead.
 
 </details>
 
@@ -250,7 +238,7 @@ A security review (Oct 2026) found three ways you could be tricked into approvin
 
 **How you're protected:**
 - Up to 2,500 characters are shown. Anything longer shows both its **start and end**, with **"⚠️ N characters NOT shown"** in between.
-- On Telegram, the **complete, unmodified text** is sent as a file just before the request, and only then can it be allowed. If the file can't be sent, the request can only be **denied** from the phone (WhatsApp works this way too).
+- On Telegram, the **complete, unmodified text** is sent as a file just before the request, and only then can it be allowed. If the file can't be sent, the request can only be **denied** from the phone.
 - Backticks are neutralised, so a command can't break out of its code block.
 
 </details>
@@ -336,7 +324,7 @@ If your company blocks scheduled tasks, `install.ps1` falls back to a Startup sh
 - **Questions answered from the phone:** VS Code's question form is cancelled and your answer arrives as your next message. The form shows as cancelled; the agent gets your answer.
 - **`/sessions` prompts** are best-effort, especially for sessions that have been idle a long time. You get a ⚠️ message if one doesn't arrive.
 - **Two sessions in the same folder, or two prompts in one session, waiting at once:** the bridge won't guess which one you mean, so answer on the laptop.
-- **Long commands** (over 2,500 characters) come as a file on Telegram. On WhatsApp they can only be denied from the phone.
+- **Long commands** (over 2,500 characters) come as a file. If it can't be sent, they can only be denied from the phone.
 - **Built on VS Code internals:** it reads session logs and uses internal VS Code commands that aren't a public API, so a VS Code update could break parts of it.
 
 ## FAQ
@@ -399,7 +387,7 @@ Yes. HTTPS is verified with the system certificate store via `truststore`, so a 
 
 ```
 Agent-Doorbell/
-├── bridge.py            # the service: routing, Telegram/WhatsApp, supervisor, local API
+├── bridge.py            # the service: routing, Telegram, supervisor, local API
 ├── hook.py              # Copilot hook entry point (fails safe)
 ├── popup.py             # optional laptop popup (off by default)
 ├── vscode-extension/    # helper extension that applies phone answers in VS Code

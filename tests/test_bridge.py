@@ -43,7 +43,8 @@ def wait_pending(br, n=1, timeout=3):
     raise AssertionError("request never became pending")
 
 
-class FakeWhatsApp(B.Transport):
+class FakePhone(B.Transport):
+    """A phone without buttons: replies are typed (1, #4 1, 1a 2c, ...)."""
     configured = True
 
 
@@ -56,7 +57,7 @@ class Base(unittest.TestCase):
         B.AGENT_HOST_DB = Path(self.tmp.name) / "no-agent-host.db"  # never read the real VS Code catalog
         B._prompt_cache.clear()
         self.cwd = str(Path(self.tmp.name) / "proj")
-        self.br = B.Bridge(cfg(), transport=FakeWhatsApp(), popup_launcher=lambda p: None)
+        self.br = B.Bridge(cfg(), transport=FakePhone(), popup_launcher=lambda p: None)
         self.br.idle = lambda: 9999  # away from the laptop unless a test says otherwise
 
     def tearDown(self):
@@ -125,7 +126,7 @@ class PermissionTests(Base):
         self.assertEqual(self.br.on_permission(self.perm()), {})
         self.assertEqual(self.br.transport.outbox, [])
 
-    def test_whatsapp_allow_once_then_session(self):
+    def test_typed_allow_once_then_session(self):
         t, box = run_async(self.br.on_permission, self.perm())
         wait_pending(self.br)
         end = time.time() + 2
@@ -435,7 +436,7 @@ class NativePromptTests(Base):
         self.assertEqual(B.pending_prompts("s1")[0], {})
 
     def test_default_push_delay_is_60s(self):
-        self.assertEqual(B.Bridge(cfg(), transport=FakeWhatsApp()).native_grace, 60)
+        self.assertEqual(B.Bridge(cfg(), transport=FakePhone()).native_grace, 60)
 
 
 class QuestionAndFollowupTests(Base):
@@ -470,7 +471,7 @@ class QuestionAndFollowupTests(Base):
         t.join(3)
         self.assertEqual(box["r"], {})
 
-    def test_turn_end_not_held_without_whatsapp(self):
+    def test_turn_end_not_held_without_a_phone(self):
         self.br.transport = B.Transport()
         self.assertEqual(self.br.on_agent_stop({"sessionId": "s1", "cwd": self.cwd}), {})
         self.assertEqual(self.br.pending, {})
@@ -739,7 +740,7 @@ class PromptFromPhoneTests(Base):
 
     def test_selection_survives_restart(self):
         self.br.handle_inbound("/use AHP2")
-        again = B.Bridge(self.br.cfg, transport=FakeWhatsApp(), popup_launcher=lambda p: None)
+        again = B.Bridge(self.br.cfg, transport=FakePhone(), popup_launcher=lambda p: None)
         self.assertEqual(again.active["id"], "AHP2-Other")
 
     def test_without_selection_gives_hint(self):
@@ -1079,16 +1080,22 @@ class TelegramTests(Base):
         t.join(3)
         self.assertIn("Postgres", box["r"]["permissionDecisionReason"])
 
-    def test_make_transport_prefers_telegram(self):
+    def test_make_transport(self):
         c = cfg()
         c["telegram"] = {"bot_token": "x", "chat_id": "1"}
-        c["twilio"] = {"account_sid": "AC", "auth_token": "t", "from": "+1", "to": "+2"}
         self.assertEqual(B.make_transport(c).name, "telegram")
-        c["provider"] = "twilio"
-        self.assertEqual(B.make_transport(c).name, "whatsapp")
         c["telegram"]["chat_id"] = ""
-        c["provider"] = "auto"
-        self.assertEqual(B.make_transport(c).name, "whatsapp")
+        self.assertEqual(B.make_transport(c).name, "dry-run")
+
+    def test_old_whatsapp_settings_are_dropped(self):
+        path = Path(tempfile.mkdtemp()) / "config.json"
+        path.write_text(json.dumps({"token": "keep", "provider": "twilio",
+                                    "twilio": {"account_sid": "AC", "auth_token": "secret"}}))
+        c = B.load_config(path)
+        self.assertNotIn("twilio", c)
+        self.assertNotIn("provider", c)
+        saved = json.loads(path.read_text())
+        self.assertEqual((saved["token"], "twilio" in saved, "provider" in saved), ("keep", False, False))
 
 
 def free_port():
@@ -1100,7 +1107,7 @@ def free_port():
 
 
 class EndToEndTests(unittest.TestCase):
-    """Real HTTP server + hook.py subprocess, WhatsApp reply simulated."""
+    """Real HTTP server + hook.py subprocess, phone reply simulated."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -1108,7 +1115,7 @@ class EndToEndTests(unittest.TestCase):
         self.cfg_path = Path(self.tmp.name) / "config.json"
         c = cfg(port=self.port, approval_wait_minutes=1)
         self.cfg_path.write_text(json.dumps(c))
-        self.br = B.Bridge(c, transport=FakeWhatsApp(), popup_launcher=lambda p: None)
+        self.br = B.Bridge(c, transport=FakePhone(), popup_launcher=lambda p: None)
         self.br.idle = lambda: 9999
         self.srv = B.ThreadingHTTPServer(("127.0.0.1", self.port), B.make_handler(self.br))
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
@@ -1408,7 +1415,7 @@ class QuietTests(Base):
         self.assertFalse(self.br.muted())
 
     def test_turn_end_delay_defaults_to_five_minutes(self):
-        b = B.Bridge(cfg(), transport=FakeWhatsApp())
+        b = B.Bridge(cfg(), transport=FakePhone())
         self.assertEqual((b.native_grace, b.turn_grace), (60, 300))
 
 
@@ -1603,7 +1610,7 @@ class FormTests(Base):
         self.assertIn("wiz-governance-reporter (private repo): Push, then archive the repo on GitHub", reason)
 
     def test_typed_codes_without_buttons(self):
-        tg, t, box = self.start(FakeWhatsApp())
+        tg, t, box = self.start(FakePhone())
         self.assertIn("*1b* Push the branch only, no PR", tg.outbox[0])
         self.br.handle_inbound("1b")                                  # part 2 keeps its default
         t.join(3)

@@ -1,7 +1,7 @@
 """Agent Doorbell: optional laptop dialog for a pending request.
 
 Reads a JSON spec on stdin, prints the user's choice as JSON on stdout.
-Closing the window prints nothing (the request stays open for WhatsApp).
+Closing the window prints nothing (the request stays open for the phone).
 """
 
 import json
