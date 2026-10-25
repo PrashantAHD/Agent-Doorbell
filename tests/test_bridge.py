@@ -1556,6 +1556,62 @@ class PickSeveralTests(Base):
         self.assertTrue(q.startswith("```{"))                          # no empty tool name line
 
 
+class FormTests(Base):
+    """Questions with several parts (VS Code shows them as pages), each with its own choices."""
+
+    ARGS = {"message": "Both steps are committed locally and verified. How should I publish?", "requestedSchema": {
+        "properties": {
+            "publish": {"type": "string", "title": "WizExpert (public repo)",
+                        "description": "Commit d5fd441 on local branch feature/governance-reporting",
+                        "oneOf": [{"const": "pr", "title": "Push the branch and open a pull request (recommended, so CI runs first)"},
+                                  {"const": "push-branch", "title": "Push the branch only, no PR"},
+                                  {"const": "hold", "title": "Don't push yet; I'll review locally first"}],
+                        "default": "pr"},
+            "private_repo": {"type": "string", "title": "wiz-governance-reporter (private repo)",
+                             "oneOf": [{"const": "push", "title": "Push feature/monthly-governance-deck; keep the repo active"},
+                                       {"const": "push-archive", "title": "Push, then archive the repo on GitHub"},
+                                       {"const": "hold", "title": "Don't push yet"}],
+                             "default": "push"}}}}
+
+    def start(self, transport=None):
+        tg = transport or FakeTelegram()
+        self.br.transport = tg
+        t, box = run_async(self.br.on_pre_tool, {"sessionId": "s1", "cwd": self.cwd, "toolName": "ask_user",
+                                                 "toolArgs": self.ARGS})
+        wait_pending(self.br)
+        time.sleep(0.1)
+        return tg, t, box
+
+    def test_each_part_gets_buttons_with_defaults(self):
+        tg, t, box = self.start()
+        msg = tg.sent("sendMessage")[0]
+        kb = msg["reply_markup"]["inline_keyboard"]
+        self.assertEqual([r[0]["text"][:5] for r in kb], ["1a ● ", "1b ○ ", "1c ○ ", "2a ● ", "2b ○ ", "2c ○ ", "Send "])
+        self.assertIn("WizExpert (public repo)", msg["text"])
+        self.assertNotIn("Push the branch only", msg["text"])       # choices are buttons, not text
+        mid = tg.next_id
+        self.br.handle_callback(kb[2][0]["callback_data"], mid)      # part 1: don't push yet
+        self.br.handle_callback(kb[4][0]["callback_data"], mid)      # part 2: push + archive
+        time.sleep(0.1)
+        redraw = [r[0]["text"][:5] for r in tg.sent("editMessageReplyMarkup")[-1]["reply_markup"]["inline_keyboard"]]
+        self.assertEqual(redraw[:6], ["1a ○ ", "1b ○ ", "1c ● ", "2a ○ ", "2b ● ", "2c ○ "])
+        self.assertEqual(len(self.br.pending), 1)
+        self.br.handle_callback(kb[6][0]["callback_data"], mid)      # Send answers
+        t.join(3)
+        reason = box["r"]["permissionDecisionReason"]
+        self.assertIn("WizExpert (public repo): Don't push yet; I'll review locally first", reason)
+        self.assertIn("wiz-governance-reporter (private repo): Push, then archive the repo on GitHub", reason)
+
+    def test_typed_codes_without_buttons(self):
+        tg, t, box = self.start(FakeWhatsApp())
+        self.assertIn("*1b* Push the branch only, no PR", tg.outbox[0])
+        self.br.handle_inbound("1b")                                  # part 2 keeps its default
+        t.join(3)
+        reason = box["r"]["permissionDecisionReason"]
+        self.assertIn("WizExpert (public repo): Push the branch only, no PR", reason)
+        self.assertIn("wiz-governance-reporter (private repo): Push feature/monthly-governance-deck", reason)
+
+
 class InstallHooksTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)

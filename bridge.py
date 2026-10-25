@@ -1191,9 +1191,26 @@ def question_choices(args: dict) -> tuple[bool, list[int]]:
     return multi, picked
 
 
-def question_card(args: dict) -> tuple[str, str, list[str]]:
+def form_fields(args: dict) -> list[dict]:
+    """Parts of a question form with several fields, each with its own choices (VS Code shows them
+    as pages). [] unless every part has choices, so buttons can answer the whole form."""
+    props = (args.get("requestedSchema") or {}).get("properties") or {}
+    if len(props) < 2:
+        return []
+    out = []
+    for name, f in props.items():
+        labels, _, multi, picked = field_choices(f if isinstance(f, dict) else {})
+        if not labels:
+            return []
+        out.append({"title": _inline(f.get("title") or name, 80).replace("*", ""), "labels": labels,
+                    "multi": multi, "picked": set(picked if multi else picked[:1])})
+    return out
+
+
+def question_card(args: dict, with_options: bool = True) -> tuple[str, str, list[str]]:
     """(heading, body, options) for an agent question, laid out like VS Code's question card:
-    the question as the title, the explanation underneath, options as buttons (listed once)."""
+    the question as the title, the explanation underneath, options as buttons (listed once).
+    with_options=False: a several-part form's choices are left out of the text (they're buttons)."""
     q = _md(_first(args, "question", "message", "prompt")).strip()
     options = [str(c if isinstance(c, str) else _first(c, "label", "title", "value"))
                for c in args.get("choices") or args.get("options") or []]
@@ -1210,13 +1227,17 @@ def question_card(args: dict) -> tuple[str, str, list[str]]:
             body.append(_md(f["description"]))
     elif props:
         heading = q or "A few questions"
-        for name, f in props.items():
+        lettered = bool(form_fields(args))
+        for n, (name, f) in enumerate(props.items(), 1):
             labels, _, multi, _ = field_choices(f)
-            line = f"• *{_inline(f.get('title') or name, 80).replace('*', '')}*"
+            line = f"*{n}. {_inline(f.get('title') or name, 80).replace('*', '')}*"
             if f.get("description"):
-                line += f" — {_inline(f['description'], 200)}"
-            if labels:
-                line += f" ({(' + ' if multi else ' / ').join(_inline(str(x), 40) for x in labels)})"
+                line += f"\n{_inline(f['description'], 200)}"
+            if labels and with_options:
+                if lettered:  # typed answers like "1a 2c"
+                    line += "".join(f"\n   *{n}{chr(97 + k)}* {_inline(str(x), 80)}" for k, x in enumerate(labels[:26]))
+                else:
+                    line += f" ({(' + ' if multi else ' / ').join(_inline(str(x), 40) for x in labels)})"
             body.append(line)
         options = []
     else:
@@ -1666,12 +1687,10 @@ class Bridge:
 
     def handle_native_question(self, sid: str, cid: str, args: dict) -> None:
         cwd = session_cwd(sid)
-        heading, text, options = question_card(args)
+        heading, text, options, qmeta, footer = self.question_parts(args)
         task, _ = request_context(sid, cid)
-        text = self._numbered(text, options) + context_block(task, "")
-        qmeta = self.question_meta(args)
-        req = self.ask("question", sid, session_title(sid, cwd), text.strip("\n"),
-                       self.question_footer(options, bool(qmeta)),
+        text = text + context_block(task, "")
+        req = self.ask("question", sid, session_title(sid, cwd), text.strip("\n"), footer,
                        self._max_wait_minutes(), options, heading=heading, meta=qmeta,
                        still_pending=lambda: cid in pending_prompts(sid)[1], release_on_return=False)
         r = req.result or {}
@@ -1953,6 +1972,15 @@ class Bridge:
                 allow.append(("Allow in this session", f"#{i} 2"))
             return [allow, deny]
         if p.kind == "question":
+            form = p.meta.get("form")
+            if form:  # several parts, each with its own choices: tap to choose, then Send
+                rows = []
+                for fi, f in enumerate(form, 1):
+                    on, off = ("☑", "☐") if f["multi"] else ("●", "○")
+                    for oi, label in enumerate(f["labels"][:12], 1):
+                        mark = on if oi - 1 in f["picked"] else off
+                        rows.append([(f"{fi}{chr(96 + oi)} {mark} {label}"[:60], f"#{i} f{fi}.{oi}")])
+                return rows + [[("Send answers", f"#{i} done")]]
             if p.meta.get("multi"):  # pick several: tap to tick, then Send
                 picked = p.meta.get("picked") or set()
                 rows = [[(("☑ " if n - 1 in picked else "☐ ") + o[:56], f"#{i} +{n}")]
@@ -1998,8 +2026,28 @@ class Bridge:
 
     @staticmethod
     def question_meta(args: dict) -> dict:
+        form = form_fields(args)
+        if form:
+            return {"form": form}
         multi, picked = question_choices(args)
         return {"multi": True, "picked": set(picked)} if multi else {}
+
+    def question_parts(self, args: dict) -> tuple[str, str, list[str], dict, str]:
+        """(heading, text, options, meta, footer) for an agent question."""
+        heading, text, options = question_card(args, with_options=not self.transport.supports_buttons)
+        qmeta = self.question_meta(args)
+        if qmeta.get("form"):
+            footer = ("Tap your choice for each part (defaults are already selected), then *Send answers*. "
+                      "Or type your answer." if self.transport.supports_buttons
+                      else "Reply with a choice for each part, e.g. *1a 2c*, or type your answer.")
+        else:
+            footer = self.question_footer(options, bool(qmeta))
+        return heading, self._numbered(text, options), options, qmeta, footer
+
+    @staticmethod
+    def form_answer(form: list[dict]) -> str:
+        return "\n".join(f"{f['title']}: " + "; ".join(f["labels"][k] for k in sorted(f["picked"]))
+                         for f in form)
 
     def question_footer(self, options: list[str], multi: bool = False) -> str:
         if multi and options:
@@ -2119,6 +2167,42 @@ class Bridge:
         elif p.kind == "question":
             if raw.get("vscode"):
                 result = {"vscode": True}
+            elif p.meta.get("form"):
+                form, t = p.meta["form"], text.strip()
+                m = re.fullmatch(r"f(\d+)\.(\d+)", t)
+                if m:  # a choice button was tapped
+                    fi, oi = int(m[1]) - 1, int(m[2]) - 1
+                    if 0 <= fi < len(form) and 0 <= oi < len(form[fi]["labels"]):
+                        with p.lock:
+                            f = form[fi]
+                            if f["multi"]:
+                                f["picked"].symmetric_difference_update({oi})
+                            else:
+                                f["picked"] = {oi}
+                        self._redraw_buttons(p)
+                    return
+                codes = re.findall(r"(\d+)\s*([a-z])", t.lower())
+                if t.lower() in ("done", "send"):
+                    missing = [str(n) for n, f in enumerate(form, 1) if not f["picked"]]
+                    if missing:
+                        self.send(f"#{p.id}: choose something for part {', '.join(missing)} first, or type your answer.")
+                        return
+                    result = {"text": self.form_answer(form)}
+                elif codes and re.fullmatch(r"(\s*[,;]?\s*\d+\s*[a-z])+\s*", t.lower()):
+                    chosen = [dict(f, picked=set()) for f in form]
+                    ok = True
+                    for n, letter in codes:
+                        fi, oi = int(n) - 1, ord(letter) - 97
+                        if not (0 <= fi < len(form) and 0 <= oi < len(form[fi]["labels"])):
+                            ok = False
+                            break
+                        chosen[fi]["picked"] = chosen[fi]["picked"] | {oi} if form[fi]["multi"] else {oi}
+                    for fi, f in enumerate(chosen):  # parts not mentioned keep their default
+                        if not f["picked"]:
+                            f["picked"] = set(form[fi]["picked"])
+                    result = {"text": self.form_answer(chosen)} if ok else {"text": t}
+                else:
+                    result = {"text": t}  # free-text answer
             elif p.meta.get("multi"):
                 t = text.strip()
                 if re.fullmatch(r"\+\d+", t):  # a tick box was tapped
@@ -2349,10 +2433,9 @@ class Bridge:
             }
         if self._at_laptop() or self.muted():
             return {}  # you're using the laptop: VS Code shows its normal question form
-        heading, text, options = question_card(args)
-        text = (self._numbered(text, options) + context_block(request_context(sid)[0], "")).strip("\n")
-        qmeta = self.question_meta(args)
-        req = self.ask("question", sid, session_title(sid, cwd), text, self.question_footer(options, bool(qmeta)),
+        heading, text, options, qmeta, footer = self.question_parts(args)
+        text = (text + context_block(request_context(sid)[0], "")).strip("\n")
+        req = self.ask("question", sid, session_title(sid, cwd), text, footer,
                        self.cfg["question_wait_minutes"], options, heading=heading, meta=qmeta)
         r = req.result or {}
         if r.get("timeout") or r.get("vscode"):
@@ -2428,10 +2511,7 @@ class Bridge:
         if len(last) > 900:
             last = last[:900] + "…"
         if q:
-            heading, body, options = question_card(q)
-            body = self._numbered(body, options)
-            qmeta = self.question_meta(q)
-            footer = self.question_footer(options, bool(qmeta))
+            heading, body, options, qmeta, footer = self.question_parts(q)
             kind = "question"
         else:
             options, heading, body, footer = [], "Agent finished", last, self.followup_footer()
