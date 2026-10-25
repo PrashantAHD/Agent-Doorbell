@@ -335,6 +335,11 @@ class Transport:
     def edit_buttons(self, ref: Any, buttons: Buttons) -> None:
         """Redraw a message's buttons (e.g. ticked options)."""
 
+    def edit_message(self, ref: Any, body: str, buttons: Buttons | None) -> None:
+        """Replace a message's text and buttons (e.g. the next page of a question)."""
+        self.edits = getattr(self, "edits", [])
+        self.edits.append((ref, to_plain(body), buttons))
+
     supports_documents = False
 
     def send_document(self, filename: str, data: bytes, caption: str = "") -> Any:
@@ -446,6 +451,27 @@ class TelegramTransport(Transport):
                                     for row in buttons]}})
         except Exception as e:
             log.debug("edit_buttons failed: %s", e)
+
+    def edit_message(self, ref: Any, body: str, buttons: Buttons | None) -> None:
+        if not ref:
+            return
+        if len(body) > 3800:
+            body = body[:3799] + "…"
+        params: dict[str, Any] = {"chat_id": self.chat_id, "message_id": ref, "disable_web_page_preview": True}
+        if buttons:
+            params["reply_markup"] = {"inline_keyboard": [
+                [{"text": label, "callback_data": data[:64]} for label, data in row] for row in buttons]}
+        try:
+            try:
+                self.call("editMessageText", {**params, "text": to_telegram_html(body), "parse_mode": "HTML"})
+            except RuntimeError as e:
+                if "not modified" in str(e).lower():
+                    return
+                if "parse" not in str(e).lower():
+                    raise
+                self.call("editMessageText", {**params, "text": to_plain(body)})
+        except Exception as e:
+            log.warning("edit_message failed: %s", e)
 
     supports_documents = True
 
@@ -1136,11 +1162,12 @@ def form_fields(args: dict) -> list[dict]:
         f = f if isinstance(f, dict) else {}
         labels, _, multi, picked = field_choices(f)
         title = _inline(f.get("title") or name, 80).replace("*", "")
+        desc = _inline(_md(f.get("description") or ""), 300)
         if labels:
-            out.append({"title": title, "labels": labels, "multi": multi,
+            out.append({"title": title, "desc": desc, "labels": labels, "multi": multi,
                         "picked": set(picked if multi else picked[:1])})
         else:
-            out.append({"title": title, "text": True, "value": "", "required": name in required})
+            out.append({"title": title, "desc": desc, "text": True, "value": "", "required": name in required})
     return out if any("labels" in f for f in out) else []
 
 
@@ -1909,15 +1936,20 @@ class Bridge:
             return [allow, deny]
         if p.kind == "question":
             form = p.meta.get("form")
-            if form:  # several parts, each with its own choices: tap to choose, then Send
+            if form:  # several parts, shown one page at a time like VS Code
+                k = p.meta.get("page", 0)
+                f = form[k]
                 rows = []
-                for fi, f in enumerate(form, 1):
-                    if f.get("text"):
-                        continue
-                    on, off = ("☑", "☐") if f["multi"] else ("●", "○")
-                    for oi, label in enumerate(f["labels"][:12], 1):
-                        mark = on if oi - 1 in f["picked"] else off
-                        rows.append([(f"{fi}{chr(96 + oi)} {mark} {label}"[:60], f"#{i} f{fi}.{oi}")])
+                if not f.get("text"):
+                    for oi, label in enumerate(f["labels"][:20], 1):
+                        on = oi - 1 in f["picked"] and not f.get("custom")
+                        if f["multi"]:
+                            text = f"{'☑' if on else '☐'} {label}"
+                        else:
+                            text = f"{oi}. {label}" + (" ✓" if on else "")
+                        rows.append([(text[:60], f"#{i} f{k + 1}.{oi}")])
+                if len(form) > 1:
+                    rows.append([("‹", f"#{i} p-"), (f"{k + 1}/{len(form)}", f"#{i} pg"), ("›", f"#{i} p+")])
                 return rows + [[("Send answers", f"#{i} done")]]
             if p.meta.get("multi"):  # pick several: tap to tick, then Send
                 picked = p.meta.get("picked") or set()
@@ -1953,20 +1985,60 @@ class Bridge:
         return detail, footer, meta
 
     def _redraw_buttons(self, p: Pending) -> None:
-        """Show the current ticks on a pick-several question (same sealed code, new labels)."""
+        """Show the current ticks on a pick-several question (same sealed code, new labels). A
+        several-part question redraws the whole message: its text shows the current part."""
         with p.lock:
             ref, n = p.meta.get("ref"), p.meta.get("seal")
         buttons = self._buttons(p)
         if not (ref and n and buttons and self.transport.supports_buttons):
             return
         sealed = [[(label, f"{n}|{data}") for label, data in row] for row in buttons]
+        if p.meta.get("form") and p.meta.get("compose"):
+            body = p.meta["compose"](self._form_text(p) + p.text)
+            threading.Thread(target=self.transport.edit_message, args=(ref, body, sealed), daemon=True).start()
+            return
         threading.Thread(target=self.transport.edit_buttons, args=(ref, sealed), daemon=True).start()
+
+    @staticmethod
+    def _form_actions(p: Pending) -> set[str]:
+        i, form = p.id, p.meta["form"]
+        acts = {f"#{i} p-", f"#{i} p+", f"#{i} pg", f"#{i} done"}
+        for fi, f in enumerate(form, 1):
+            acts |= {f"#{i} f{fi}.{oi}" for oi in range(1, len(f.get("labels") or []) + 1)}
+        return acts
+
+    @staticmethod
+    def _part_answer(f: dict) -> str:
+        if f.get("text"):
+            return f.get("value") or ""
+        if f.get("custom"):
+            return f["custom"]
+        return "; ".join(f["labels"][k] for k in sorted(f["picked"]))
+
+    def _form_text(self, p: Pending) -> str:
+        """The current part of a several-part question, laid out like VS Code's question pages."""
+        form, k = p.meta["form"], p.meta.get("page", 0)
+        f = form[k]
+        lines = [p.meta["intro"]] if p.meta.get("intro") else []
+        part = f"*{f['title']}*"
+        if f.get("desc"):
+            part += f"\n{f['desc']}"
+        if f.get("text"):
+            part += "\n✏️ " + (f"Your answer: {f['value']}" if f.get("value") else "Type your answer below.")
+        elif f.get("custom"):
+            part += f"\n✏️ Your answer: {f['custom']}"
+        lines.append(part)
+        if len(form) > 1:
+            summary = [f"{n}. {g['title']}: {_inline(self._part_answer(g), 60) or '—'}"
+                       for n, g in enumerate(form, 1)]
+            lines.append(f"{MORE_OPEN}Your answers\n" + "\n".join(summary) + MORE_CLOSE)
+        return "\n\n".join(lines)
 
     @staticmethod
     def question_meta(args: dict) -> dict:
         form = form_fields(args)
         if form:
-            return {"form": form}
+            return {"form": form, "page": 0}
         multi, picked = question_choices(args)
         return {"multi": True, "picked": set(picked)} if multi else {}
 
@@ -1975,30 +2047,20 @@ class Bridge:
         heading, text, options = question_card(args, with_options=not self.transport.supports_buttons)
         qmeta = self.question_meta(args)
         if qmeta.get("form"):
-            texts = [f["title"] for f in qmeta["form"] if f.get("text")]
             if self.transport.supports_buttons:
-                footer = "Tap your choice for each part (defaults are already selected), then *Send answers*."
-                if texts:
-                    footer += (f" To fill in “{texts[0]}”, type it here: that sends everything." if len(texts) == 1
-                               else " Or type a reply to answer the written parts; that sends everything.")
-                else:
-                    footer += " Or type your answer."
-            else:
-                footer = "Reply with a choice for each part, e.g. *1a 2c*, or type your answer."
+                # Shown one part at a time, like VS Code: the text is drawn per page.
+                q = _md(_first(args, "question", "message", "prompt")).strip()
+                qmeta["intro"] = _clip(q, 1500)[0] if q else ""
+                heading = "Question" if len(qmeta["form"]) > 1 else heading
+                footer = "Tap an option, or type a custom answer. ‹ › moves between parts; *Send answers* when ready."
+                return heading, "", options, qmeta, footer
+            footer = "Reply with a choice for each part, e.g. *1a 2c*, or type your answer."
         else:
             footer = self.question_footer(options, bool(qmeta))
         return heading, self._numbered(text, options), options, qmeta, footer
 
-    @staticmethod
-    def form_answer(form: list[dict]) -> str:
-        lines = []
-        for f in form:
-            if f.get("text"):
-                if f.get("value"):
-                    lines.append(f"{f['title']}: {f['value']}")
-            else:
-                lines.append(f"{f['title']}: " + "; ".join(f["labels"][k] for k in sorted(f["picked"])))
-        return "\n".join(lines)
+    def form_answer(self, form: list[dict]) -> str:
+        return "\n".join(f"{f['title']}: {self._part_answer(f)}" for f in form if self._part_answer(f))
 
     def question_footer(self, options: list[str], multi: bool = False) -> str:
         if multi and options:
@@ -2039,9 +2101,17 @@ class Bridge:
                     footer = p.meta.get("fallback_footer", footer)
             buttons = self._buttons(p) if self.transport.supports_buttons else None
             head = f"*{heading}*\n" if heading else ""
-            body = f"{head}{SUB_OPEN}{title} · #{p.id}{SUB_CLOSE}" + (f"\n\n{text.strip()}" if text.strip() else "") \
-                + (f"\n\n{footer}" if footer else "")
+
+            def compose(inner: str) -> str:
+                return f"{head}{SUB_OPEN}{title} · #{p.id}{SUB_CLOSE}" + (f"\n\n{inner.strip()}" if inner.strip() else "") \
+                    + (f"\n\n{footer}" if footer else "")
+
+            p.meta["compose"] = compose
+            body = compose((self._form_text(p) + text) if p.meta.get("form") and buttons else text)
             n, sealed = self._seal(buttons) if buttons else ("", None)
+            if n and p.meta.get("form"):
+                with self.plock:  # every page's buttons are valid for this message, not just the first
+                    self.cb_tokens[n]["data"] |= self._form_actions(p)
             ref = self.transport.send(body, sealed)
             if n:
                 self._register_buttons(n, ref)
@@ -2118,31 +2188,58 @@ class Bridge:
         elif p.kind == "question":
             if raw.get("vscode"):
                 result = {"vscode": True}
-            elif p.meta.get("form"):
+            elif p.meta.get("form") and self.transport.supports_buttons:
+                # Paged like VS Code: buttons answer the part on screen, typing is its custom answer.
                 form, t = p.meta["form"], text.strip()
+                last = len(form) - 1
+                cur = form[p.meta.get("page", 0)]
+                if t.isdigit() and not cur.get("text") and 1 <= int(t) <= len(cur["labels"]):
+                    t = f"f{p.meta.get('page', 0) + 1}.{t}"  # typed option number, like VS Code's 1-9 keys
                 m = re.fullmatch(r"f(\d+)\.(\d+)", t)
-                if m:  # a choice button was tapped
+                if t in ("p-", "p+", "pg"):
+                    with p.lock:
+                        k = p.meta.get("page", 0) + {"p-": -1, "p+": 1, "pg": 0}[t]
+                        p.meta["page"] = max(0, min(last, k))
+                    self._redraw_buttons(p)
+                    return
+                if m:  # an option was tapped
                     fi, oi = int(m[1]) - 1, int(m[2]) - 1
                     if 0 <= fi < len(form) and 0 <= oi < len(form[fi].get("labels") or []):
                         with p.lock:
                             f = form[fi]
+                            f["custom"] = ""
                             if f["multi"]:
                                 f["picked"].symmetric_difference_update({oi})
                             else:
                                 f["picked"] = {oi}
+                                p.meta["page"] = min(last, fi + 1)  # on to the next part, like VS Code
                         self._redraw_buttons(p)
                     return
-                codes = re.findall(r"(\d+)\s*([a-z])", t.lower())
-                texts = [f for f in form if f.get("text")]
                 if t.lower() in ("done", "send"):
-                    missing = [str(n) for n, f in enumerate(form, 1)
-                               if (f.get("text") and f.get("required")) or (not f.get("text") and not f["picked"])]
+                    missing = [str(n) for n, f in enumerate(form, 1) if not self._part_answer(f)
+                               and (not f.get("text") or f.get("required"))]
                     if missing:
-                        self.send(f"#{p.id}: part {', '.join(missing)} still needs an answer: tap a choice, "
-                                  "or type the written part here.")
+                        with p.lock:
+                            p.meta["page"] = int(missing[0]) - 1
+                        self._redraw_buttons(p)
+                        self.send(f"#{p.id}: part {', '.join(missing)} still needs an answer.")
                         return
                     result = {"text": self.form_answer(form)}
-                elif codes and re.fullmatch(r"(\s*[,;]?\s*\d+\s*[a-z])+\s*", t.lower()):
+                else:  # typed: the custom answer for the part on screen
+                    with p.lock:
+                        k = p.meta.get("page", 0)
+                        f = form[k]
+                        if f.get("text"):
+                            f["value"] = t
+                        else:
+                            f["custom"] = t
+                        p.meta["page"] = min(last, k + 1)
+                    self._redraw_buttons(p)
+                    return
+            elif p.meta.get("form"):
+                form, t = p.meta["form"], text.strip()
+                codes = re.findall(r"(\d+)\s*([a-z])", t.lower())
+                if codes and re.fullmatch(r"(\s*[,;]?\s*\d+\s*[a-z])+\s*", t.lower()):
                     chosen = [dict(f, picked=set()) if not f.get("text") else dict(f) for f in form]
                     ok = True
                     for n, letter in codes:
@@ -2155,10 +2252,6 @@ class Bridge:
                         if not f.get("text") and not f["picked"]:
                             f["picked"] = set(form[fi]["picked"])
                     result = {"text": self.form_answer(chosen)} if ok else {"text": t}
-                elif texts and all(f["picked"] for f in form if not f.get("text")):
-                    # Typed text fills the written part(s); the choices go along as selected.
-                    filled = [dict(f, value=t) if f.get("text") else f for f in form]
-                    result = {"text": self.form_answer(filled)}
                 else:
                     result = {"text": t}  # free-text answer
             elif p.meta.get("multi"):

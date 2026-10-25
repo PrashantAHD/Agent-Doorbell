@@ -1563,117 +1563,123 @@ class PickSeveralTests(Base):
         self.assertTrue(q.startswith("```{"))                          # no empty tool name line
 
 
-class FormTests(Base):
-    """Questions with several parts (VS Code shows them as pages), each with its own choices."""
+class PagedFormTests(Base):
+    """Several-part questions on the phone look like VS Code: one part per page, ‹ 1/4 ›,
+    numbered options with a check mark, typing = custom answer, then Send answers."""
 
-    ARGS = {"message": "Both steps are committed locally and verified. How should I publish?", "requestedSchema": {
-        "properties": {
-            "publish": {"type": "string", "title": "WizExpert (public repo)",
-                        "description": "Commit d5fd441 on local branch feature/governance-reporting",
-                        "oneOf": [{"const": "pr", "title": "Push the branch and open a pull request (recommended, so CI runs first)"},
-                                  {"const": "push-branch", "title": "Push the branch only, no PR"},
-                                  {"const": "hold", "title": "Don't push yet; I'll review locally first"}],
-                        "default": "pr"},
-            "private_repo": {"type": "string", "title": "wiz-governance-reporter (private repo)",
-                             "oneOf": [{"const": "push", "title": "Push feature/monthly-governance-deck; keep the repo active"},
-                                       {"const": "push-archive", "title": "Push, then archive the repo on GitHub"},
-                                       {"const": "hold", "title": "Don't push yet"}],
-                             "default": "push"}}}}
+    ARGS = {"message": "Test push: answer from the phone.", "requestedSchema": {"properties": {
+        "concept": {"type": "string", "title": "Logo concept", "default": "A",
+                    "oneOf": [{"const": "A", "title": "A · Security graph shield"},
+                              {"const": "B", "title": "B · Cloud radar"},
+                              {"const": "C", "title": "C · Verified cube"}]},
+        "palette": {"type": "string", "title": "Colours", "default": "blue-teal",
+                    "oneOf": [{"const": "blue-teal", "title": "Blue to teal"},
+                              {"const": "indigo-violet", "title": "Indigo to violet"}]},
+        "wordmark": {"type": "boolean", "title": "Include the name inside the logo?", "default": False},
+        "notes": {"type": "string", "title": "Any tweaks? (optional)"}}}}
 
-    def start(self, transport=None):
+    def start(self, transport=None, args=None):
         tg = transport or FakeTelegram()
         self.br.transport = tg
         t, box = run_async(self.br.on_pre_tool, {"sessionId": "s1", "cwd": self.cwd, "toolName": "ask_user",
-                                                 "toolArgs": self.ARGS})
+                                                 "toolArgs": args or self.ARGS})
         wait_pending(self.br)
         time.sleep(0.1)
+        self.mid = getattr(tg, "next_id", None)  # the question message
         return tg, t, box
 
-    def test_each_part_gets_buttons_with_defaults(self):
-        tg, t, box = self.start()
-        msg = tg.sent("sendMessage")[0]
-        kb = msg["reply_markup"]["inline_keyboard"]
-        self.assertEqual([r[0]["text"][:5] for r in kb], ["1a ● ", "1b ○ ", "1c ○ ", "2a ● ", "2b ○ ", "2c ○ ", "Send "])
-        self.assertIn("WizExpert (public repo)", msg["text"])
-        self.assertNotIn("Push the branch only", msg["text"])       # choices are buttons, not text
-        mid = tg.next_id
-        self.br.handle_callback(kb[2][0]["callback_data"], mid)      # part 1: don't push yet
-        self.br.handle_callback(kb[4][0]["callback_data"], mid)      # part 2: push + archive
+    def page(self, tg):
+        """(text, button labels, button data) of the message as it looks now."""
+        edits = tg.sent("editMessageText")
+        m = edits[-1] if edits else tg.sent("sendMessage")[0]
+        kb = m["reply_markup"]["inline_keyboard"]
+        return m["text"], [b["text"] for r in kb for b in r], [b["callback_data"] for r in kb for b in r]
+
+    def tap(self, tg, label):
+        _, labels, data = self.page(tg)
+        self.br.handle_callback(data[labels.index(label)], self.mid)
         time.sleep(0.1)
-        redraw = [r[0]["text"][:5] for r in tg.sent("editMessageReplyMarkup")[-1]["reply_markup"]["inline_keyboard"]]
-        self.assertEqual(redraw[:6], ["1a ○ ", "1b ○ ", "1c ● ", "2a ○ ", "2b ● ", "2c ○ "])
-        self.assertEqual(len(self.br.pending), 1)
-        self.br.handle_callback(kb[6][0]["callback_data"], mid)      # Send answers
+
+    def test_like_vs_code(self):
+        tg, t, box = self.start()
+        text, labels, _ = self.page(tg)
+        self.assertIn("<b>Logo concept</b>", text)
+        self.assertNotIn("Colours</b>", text)                       # one part per page
+        self.assertEqual(labels, ["1. A · Security graph shield ✓", "2. B · Cloud radar", "3. C · Verified cube",
+                                  "‹", "1/4", "›", "Send answers"])
+        self.tap(tg, "2. B · Cloud radar")                         # select, move on to part 2
+        text, labels, _ = self.page(tg)
+        self.assertIn("<b>Colours</b>", text)
+        self.assertIn("2/4", labels)
+        self.tap(tg, "›")
+        text, labels, _ = self.page(tg)
+        self.assertEqual(labels[:2], ["1. Yes", "2. No ✓"])         # yes/no part, default No
+        self.tap(tg, "1. Yes")
+        text, labels, _ = self.page(tg)
+        self.assertIn("Type your answer below", text)               # free-text part: no option buttons
+        self.assertEqual(labels, ["‹", "4/4", "›", "Send answers"])
+        self.br.handle_inbound("make it rounder")                   # custom answer for this part
+        time.sleep(0.1)
+        self.assertIn("Your answer: make it rounder", self.page(tg)[0])
+        self.assertEqual(len(self.br.pending), 1)                   # nothing sent until Send
+        self.tap(tg, "Send answers")
         t.join(3)
         reason = box["r"]["permissionDecisionReason"]
-        self.assertIn("WizExpert (public repo): Don't push yet; I'll review locally first", reason)
-        self.assertIn("wiz-governance-reporter (private repo): Push, then archive the repo on GitHub", reason)
+        for line in ("Logo concept: B · Cloud radar", "Colours: Blue to teal",
+                     "Include the name inside the logo?: Yes", "Any tweaks? (optional): make it rounder"):
+            self.assertIn(line, reason)
+
+    def test_back_and_custom_answer_for_a_choice_part(self):
+        tg, t, box = self.start()
+        self.br.handle_inbound("a hexagon instead")                 # custom answer for part 1
+        time.sleep(0.1)
+        self.assertIn("2/4", self.page(tg)[1])
+        self.tap(tg, "‹")
+        text, labels, _ = self.page(tg)
+        self.assertIn("Your answer: a hexagon instead", text)
+        self.assertFalse(any(x.endswith("✓") for x in labels))     # custom answer replaces the choice
+        self.br.handle_inbound("3")                                 # typed number picks option 3
+        time.sleep(0.1)
+        self.tap(tg, "Send answers")
+        t.join(3)
+        reason = box["r"]["permissionDecisionReason"]
+        self.assertIn("Logo concept: C · Verified cube", reason)
+        self.assertNotIn("Any tweaks", reason)                     # optional and left empty
+
+    def test_send_needs_every_choice_part(self):
+        args = {"message": "Pick", "requestedSchema": {"properties": {
+            "a": {"type": "string", "title": "First", "oneOf": [{"const": "x", "title": "X"}]},
+            "b": {"type": "string", "title": "Second", "oneOf": [{"const": "y", "title": "Y"}]}}}}
+        tg, t, box = self.start(args=args)
+        self.tap(tg, "Send answers")
+        self.assertEqual(len(self.br.pending), 1)
+        self.assertIn("still needs an answer", tg.sent("sendMessage")[-1]["text"])
+        self.tap(tg, "1. X")
+        self.tap(tg, "1. Y")
+        self.tap(tg, "Send answers")
+        t.join(3)
+        self.assertIn("First: X\nSecond: Y", box["r"]["permissionDecisionReason"])
+
+    def test_forged_page_actions_still_rejected(self):
+        tg, t, box = self.start()
+        _, labels, data = self.page(tg)
+        code = data[0].split("|")[0]
+        pid = min(self.br.pending)
+        self.br.handle_callback(f"{code}|#999 f1.1", tg.next_id)    # another request's action
+        self.br.handle_callback(f"{code}|#{pid} f9.9", tg.next_id)  # an option that doesn't exist
+        time.sleep(0.1)
+        self.assertEqual(self.page(tg)[1][0], "1. A · Security graph shield ✓")
+        self.assertEqual(len(self.br.pending), 1)
 
     def test_typed_codes_without_buttons(self):
         tg, t, box = self.start(FakePhone())
-        self.assertIn("*1b* Push the branch only, no PR", tg.outbox[0])
-        self.br.handle_inbound("1b")                                  # part 2 keeps its default
-        t.join(3)
-        reason = box["r"]["permissionDecisionReason"]
-        self.assertIn("WizExpert (public repo): Push the branch only, no PR", reason)
-        self.assertIn("wiz-governance-reporter (private repo): Push feature/monthly-governance-deck", reason)
-
-
-class MixedFormTests(Base):
-    """Several-part questions that mix choices with yes/no and free-text parts."""
-
-    YESNO = {"message": "Which direction for an original WizExpert logo?", "requestedSchema": {"properties": {
-        "style": {"type": "string", "title": "Logo concept", "default": "shield-wand",
-                  "oneOf": [{"const": "shield-wand", "title": "Shield + magic wand"},
-                            {"const": "monogram", "title": "Bold WE monogram"}]},
-        "palette": {"type": "string", "title": "Colours", "default": "blue-teal",
-                    "oneOf": [{"const": "blue-teal", "title": "Blue to teal (current)"},
-                              {"const": "indigo-violet", "title": "Indigo to violet"}]},
-        "wordmark": {"type": "boolean", "title": "Include the name inside the logo?", "default": False}}}}
-    NOTES = {"message": "Which one should I polish for the README?", "requestedSchema": {"properties": {
-        "choice": {"type": "string", "title": "Logo concept", "default": "A",
-                   "oneOf": [{"const": "A", "title": "A · Security graph shield"},
-                             {"const": "B", "title": "B · Cloud radar"}]},
-        "notes": {"type": "string", "title": "Any tweaks? (optional)", "description": "e.g. 'A but filled shield'"}}}}
-
-    def start(self, args):
-        tg = FakeTelegram()
-        self.br.transport = tg
-        t, box = run_async(self.br.on_pre_tool, {"sessionId": "s1", "cwd": self.cwd, "toolName": "ask_user",
-                                                 "toolArgs": args})
-        wait_pending(self.br)
-        time.sleep(0.1)
-        return tg, t, box, tg.sent("sendMessage")[0]
-
-    def test_yes_no_part_gets_buttons(self):
-        tg, t, box, msg = self.start(self.YESNO)
-        kb = msg["reply_markup"]["inline_keyboard"]
-        self.assertEqual([r[0]["text"] for r in kb][-3:], ["3a ○ Yes", "3b ● No", "Send answers"])
-        self.br.handle_callback(kb[-3][0]["callback_data"], tg.next_id)   # Yes
-        self.br.handle_callback(kb[-1][0]["callback_data"], tg.next_id)   # Send
-        t.join(3)
-        reason = box["r"]["permissionDecisionReason"]
-        self.assertIn("Logo concept: Shield + magic wand", reason)
-        self.assertIn("Include the name inside the logo?: Yes", reason)
-
-    def test_free_text_part_is_filled_by_typing(self):
-        tg, t, box, msg = self.start(self.NOTES)
-        kb = msg["reply_markup"]["inline_keyboard"]
-        self.assertEqual([r[0]["text"] for r in kb], ["1a ● A · Security graph shield", "1b ○ B · Cloud radar",
-                                                      "Send answers"])
-        self.assertIn("Type it as your reply", msg["text"])
-        self.br.handle_callback(kb[1][0]["callback_data"], tg.next_id)    # pick B
-        self.br.handle_inbound("make it rounder")                         # fills "Any tweaks?" and sends
+        self.assertIn("*1b* B · Cloud radar", tg.outbox[0])
+        self.br.handle_inbound("1b 3a")
         t.join(3)
         reason = box["r"]["permissionDecisionReason"]
         self.assertIn("Logo concept: B · Cloud radar", reason)
-        self.assertIn("Any tweaks? (optional): make it rounder", reason)
-
-    def test_send_without_optional_text(self):
-        tg, t, box, msg = self.start(self.NOTES)
-        self.br.handle_callback(msg["reply_markup"]["inline_keyboard"][-1][0]["callback_data"], tg.next_id)
-        t.join(3)
-        self.assertNotIn("Any tweaks", box["r"]["permissionDecisionReason"])
+        self.assertIn("Colours: Blue to teal", reason)              # default kept
+        self.assertIn("Include the name inside the logo?: Yes", reason)
 
     def test_single_yes_no_question(self):
         args = {"message": "Push now?", "requestedSchema": {"properties": {"go": {"type": "boolean", "title": "Push now?"}}}}
