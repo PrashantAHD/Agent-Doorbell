@@ -19,6 +19,11 @@ Get-CimInstance Win32_Process -Filter "Name like 'python%'" |
     Sort-Object { -not $_.CommandLine.Contains('supervise') } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Host "Stopped PID $($_.ProcessId)" }
 
+$py = Get-Command python -ErrorAction SilentlyContinue
+if ($py) {
+    Push-Location $here
+    try { & $py.Source bridge.py uninstall-hooks | ForEach-Object { Write-Host $_ } } finally { Pop-Location }
+}
 $copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $env:USERPROFILE '.copilot' }
 foreach ($f in 'agent-doorbell.json', 'whatsapp-hitl.json') {
     Remove-Item (Join-Path $copilotHome "hooks\$f") -ErrorAction SilentlyContinue

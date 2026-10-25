@@ -1,5 +1,6 @@
 # Installs Agent Doorbell for all VS Code Copilot sessions of this Windows user.
-#  - writes the user-level Copilot hook file (~/.copilot/hooks/agent-doorbell.json)
+#  - writes the user-level Copilot hook file (~/.copilot/hooks/agent-doorbell.json), plus Claude
+#    (~/.claude/settings.json) and Codex (~/.codex/hooks.json) hooks when those agents are installed
 #  - installs the helper VS Code extension
 #  - registers the "Agent Doorbell" scheduled task: starts the supervisor at logon and relaunches
 #    it every 5 minutes if it was stopped (the supervisor restarts a crashed or hung bridge)
@@ -26,33 +27,10 @@ $running | Sort-Object { -not $_.CommandLine.Contains('supervise') } | ForEach-O
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Host "Stopped PID $($_.ProcessId)"
 }
 
-# Copilot hooks.
-$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $env:USERPROFILE '.copilot' }
-$hooksDir = Join-Path $copilotHome 'hooks'
-New-Item -ItemType Directory -Force -Path $hooksDir | Out-Null
-Remove-Item (Join-Path $hooksDir 'whatsapp-hitl.json') -ErrorAction SilentlyContinue  # name used by older versions
-$hookPy = Join-Path $here 'hook.py'
-function HookEntry([string]$evt, [int]$timeoutSec, [string]$matcher) {
-    $e = [ordered]@{
-        type       = 'command'
-        powershell = "& '$py' '$hookPy' $evt"
-        timeoutSec = $timeoutSec
-    }
-    if ($matcher) { $e.matcher = $matcher }
-    return ,@($e)
-}
-$hooks = [ordered]@{
-    version = 1
-    hooks   = [ordered]@{
-        permissionRequest = HookEntry 'permissionRequest' ([int]($cfg.approval_wait_minutes * 60 + 120)) ''
-        preToolUse        = HookEntry 'preToolUse' ([int]($cfg.question_wait_minutes * 60 + 120)) 'ask_user'
-        agentStop         = HookEntry 'agentStop' ([int]($cfg.followup_wait_minutes * 60 + 120)) ''
-        notification      = HookEntry 'notification' 30 'permission_prompt|elicitation_dialog'
-    }
-}
-$hookFile = Join-Path $hooksDir 'agent-doorbell.json'
-[IO.File]::WriteAllText($hookFile, ($hooks | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding $false))
-Write-Host "Hook file written: $hookFile"
+# Hooks: Copilot always; Claude and Codex too when they're installed for this user.
+Push-Location $here
+try { & $py bridge.py install-hooks | ForEach-Object { Write-Host $_ } } finally { Pop-Location }
+if ($LASTEXITCODE -ne 0) { throw "Writing the hooks failed." }
 
 # Helper VS Code extension: applies phone answers to prompts that are already showing in VS Code.
 Push-Location $here
@@ -103,11 +81,15 @@ try {
 if ($useTask) { Start-ScheduledTask -TaskName $taskName }
 else { Start-Process -FilePath $pyw -ArgumentList "`"$bridgePy`" supervise" -WorkingDirectory $here -WindowStyle Hidden }
 $h = $null
-for ($i = 0; $i -lt 30 -and -not $h; $i++) {
-    Start-Sleep -Milliseconds 700
-    try { $h = Invoke-RestMethod "http://127.0.0.1:$($cfg.port)/health" -TimeoutSec 3 } catch { }
-}
-if (-not $h) { throw "The bridge didn't start. See supervisor.log and bridge.log in $here" }
+Push-Location $here
+try {
+    for ($i = 0; $i -lt 30 -and -not $h; $i++) {
+        Start-Sleep -Milliseconds 700
+        $out = & $py bridge.py health 2>$null
+        if ($LASTEXITCODE -eq 0) { $h = $out | ConvertFrom-Json }
+    }
+} finally { Pop-Location }
+if (-not $h) { throw "The bridge didn't start (or another program is using port $($cfg.port)). See supervisor.log and bridge.log in $here" }
 Write-Host "Bridge running: $($h | ConvertTo-Json -Compress)"
 if ($h.channel -eq 'dry-run') {
     Write-Warning "No phone channel configured yet (dry-run). Run: python bridge.py setup-telegram   then re-run this script."

@@ -2,7 +2,7 @@
   "name": "agent-doorbell-helper",
   "displayName": "Agent Doorbell Helper",
   "description": "Lets the local phone bridge press Accept/Skip on Copilot prompts you answered from your phone.",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "publisher": "local",
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Other"],

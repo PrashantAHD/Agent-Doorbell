@@ -10,6 +10,8 @@ Usage:
     python bridge.py setup-telegram  pair a Telegram bot (recommended, free)
     python bridge.py setup           Twilio WhatsApp setup
     python bridge.py test-send       send a test message to your phone
+    python bridge.py install-hooks   write the Copilot (and Claude/Codex) hooks; uninstall-hooks removes them
+    python bridge.py health          check that the real bridge is running
 """
 
 from __future__ import annotations
@@ -18,6 +20,8 @@ import base64
 import ctypes
 import fnmatch
 import getpass
+import hashlib
+import hmac
 import html
 import itertools
 import json
@@ -26,6 +30,7 @@ import logging.handlers
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import ssl
 import subprocess
@@ -45,9 +50,12 @@ HERE = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("HITL_BRIDGE_CONFIG", HERE / "config.json"))
 LOG_PATH = HERE / "bridge.log"
 COPILOT_HOME = Path(os.environ.get("COPILOT_HOME", Path.home() / ".copilot"))
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 SESSION_STATE = COPILOT_HOME / "session-state"
 WA_MAX = 1550  # Twilio WhatsApp body limit is 1600 chars
-EXT_VERSION = "9"  # must match X-Ext-Version sent by vscode-extension/extension.js
+EXT_VERSION = "10"  # must match X-Ext-Version sent by vscode-extension/extension.js
+ATTACH_MAX = 1_000_000  # longest command/diff sent to the phone as a file
 
 DEFAULT_CONFIG: dict[str, Any] = {
     # "auto" uses Telegram when paired, otherwise Twilio WhatsApp when configured.
@@ -93,6 +101,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "laptop_popup": False,
     "escalate_after_seconds": 60,
     "notify_turn_end": True,
+    # A finished turn reaches the phone only after this many seconds without a reply in VS Code
+    # (turns you started from the phone are sent right away).
+    "turn_end_after_seconds": 300,
+    # Daily window with no phone notifications, e.g. "23:00-07:00" (local time). "" = off.
+    # Requests still waiting when it ends are sent then.
+    "quiet_hours": "",
     "poll_seconds_active": 2,
     "poll_seconds_idle": 15,
     # Tools VS Code approves silently; never routed to the phone.
@@ -140,16 +154,130 @@ class _LastInputInfo(ctypes.Structure):
     _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
 
 
-def idle_seconds() -> float:
-    """Seconds since the last keyboard/mouse input on this Windows session."""
-    if os.name != "nt":
-        return 0.0
+def _idle_windows() -> float | None:
     info = _LastInputInfo()
     info.cbSize = ctypes.sizeof(info)
     if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
-        return 0.0
+        return None
     ctypes.windll.kernel32.GetTickCount.restype = ctypes.c_uint
     return ((ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0
+
+
+def _run_quiet(cmd: list[str], timeout: float = 3) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _idle_macos() -> float | None:
+    m = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', _run_quiet(["ioreg", "-c", "IOHIDSystem", "-d", "4"]))
+    return int(m.group(1)) / 1e9 if m else None
+
+
+def _idle_linux() -> float | None:
+    if shutil.which("xprintidle"):
+        out = _run_quiet(["xprintidle"]).strip()
+        if out.isdigit():
+            return int(out) / 1000.0
+    if shutil.which("gdbus"):  # GNOME (X11 and Wayland)
+        out = _run_quiet(["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.IdleMonitor",
+                          "--object-path", "/org/gnome/Mutter/IdleMonitor/Core",
+                          "--method", "org.gnome.Mutter.IdleMonitor.GetIdletime"])
+        m = re.search(r"(\d+)", out)
+        if m:
+            return int(m.group(1)) / 1000.0
+    return None
+
+
+def idle_seconds() -> float:
+    """Seconds since the last keyboard/mouse input. 0 when it can't be measured (treated as
+    "at the laptop", so nothing is held for the phone by mistake)."""
+    try:
+        if os.name == "nt":
+            v = _idle_windows()
+        elif sys.platform == "darwin":
+            v = _idle_macos()
+        else:
+            v = _idle_linux()
+    except Exception:
+        v = None
+    return v if v is not None else 0.0
+
+
+# ----------------------------------------------------------------------------
+# Local API authentication. Clients never send the token itself: each request carries an HMAC
+# over its content, and the bridge proves it knows the token by signing every response. A program
+# that grabs the port while the bridge is stopped learns nothing and can't answer for it.
+# ----------------------------------------------------------------------------
+
+AUTH_WINDOW = 300  # seconds a signed request stays valid
+
+
+def _mac(token: str, *parts: str) -> str:
+    return hmac.new(token.encode(), "\n".join(parts).encode(), hashlib.sha256).hexdigest()
+
+
+def body_digest(data: bytes | None) -> str:
+    return hashlib.sha256(data or b"").hexdigest()
+
+
+def sign_request(token: str, method: str, path: str, body: bytes | None) -> dict[str, str]:
+    """Headers that authenticate one request to the bridge."""
+    nonce, ts = secrets.token_hex(16), str(int(time.time()))
+    return {"X-Doorbell-Nonce": nonce, "X-Doorbell-Time": ts,
+            "X-Doorbell-Auth": _mac(token, "req", method, path, ts, nonce, body_digest(body))}
+
+
+def response_proof(token: str, nonce: str, body: bytes) -> str:
+    return _mac(token, "resp", nonce, body_digest(body))
+
+
+def check_proof(token: str, nonce: str, body: bytes, proof: str | None) -> bool:
+    return bool(proof) and hmac.compare_digest(response_proof(token, nonce, body), proof or "")
+
+
+def verified_health(port: int, token: str, timeout: float = 5) -> dict | None:
+    """/health from the real bridge (it must prove it knows the token), else None."""
+    nonce = secrets.token_hex(16)
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health?nonce={nonce}", timeout=timeout) as r:
+            body = r.read()
+            if not check_proof(token, nonce, body, r.headers.get("X-Doorbell-Proof")):
+                return None
+            data = json.loads(body.decode() or "{}")
+            return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+# ----------------------------------------------------------------------------
+# Quiet hours
+# ----------------------------------------------------------------------------
+
+def in_quiet_hours(spec: str, now: datetime | None = None) -> bool:
+    """True if `now` falls in a daily "HH:MM-HH:MM" window (which may cross midnight)."""
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*", spec or "")
+    if not m:
+        return False
+    a, b = int(m[1]) * 60 + int(m[2]), int(m[3]) * 60 + int(m[4])
+    now = now or datetime.now()
+    t = now.hour * 60 + now.minute
+    if a == b:
+        return False
+    return a <= t < b if a < b else (t >= a or t < b)
+
+
+def parse_duration(text: str, default_minutes: float = 60) -> float | None:
+    """'30m', '2h', '1d', '45' (minutes) -> seconds. None if it can't be read."""
+    t = (text or "").strip().lower()
+    if not t:
+        return default_minutes * 60
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(m|min|mins|minutes?|h|hr|hrs|hours?|d|days?)?", t)
+    if not m:
+        return None
+    n, unit = float(m[1]), (m[2] or "m")[0]
+    return n * {"m": 60, "h": 3600, "d": 86400}[unit]
 
 
 # ----------------------------------------------------------------------------
@@ -219,6 +347,12 @@ class Transport:
     def finalize(self, ref: Any, label: str) -> None:
         """Mark a request message as resolved (e.g. replace its buttons)."""
         self.finals.append((ref, label))
+
+    supports_documents = False
+
+    def send_document(self, filename: str, data: bytes, caption: str = "") -> Any:
+        """Send a file; returns a truthy message reference on success."""
+        return None
 
     def poll(self) -> list[str]:
         return []
@@ -315,6 +449,40 @@ class TelegramTransport(Transport):
                 "inline_keyboard": [[{"text": label, "callback_data": "noop"}]]}})
         except Exception as e:
             log.debug("finalize failed: %s", e)
+
+    supports_documents = True
+
+    def upload(self, method: str, fields: dict[str, str], file_field: str, filename: str, data: bytes,
+               timeout: float = 60) -> Any:
+        boundary = "----doorbell" + secrets.token_hex(12)
+        parts = []
+        for k, v in fields.items():
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+        safe = re.sub(r'[^\w.\-]', "_", filename)[:60] or "file.txt"
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; filename="{safe}"\r\n'
+                     "Content-Type: text/plain; charset=utf-8\r\n\r\n".encode() + data + b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+        req = urllib.request.Request(self.API.format(token=self.token, method=method), data=b"".join(parts),
+                                     headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                                     method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as r:
+                res = json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            res = json.loads(e.read().decode(errors="replace") or "{}")
+        if not res.get("ok"):
+            raise RuntimeError(f"Telegram {method}: {res.get('description', 'request failed')}")
+        return res["result"]
+
+    def send_document(self, filename: str, data: bytes, caption: str = "") -> Any:
+        try:
+            msg = self.upload("sendDocument", {"chat_id": self.chat_id, "caption": caption[:1000]},
+                              "document", filename, data)
+            return msg["message_id"]
+        except Exception as e:
+            self.last_error = str(e)[:300]
+            log.error("Telegram sendDocument failed: %s", self.last_error)
+            return None
 
     def poll(self) -> list[Any]:
         """New messages (str) and button taps (dict with data + message_id) from the paired chat."""
@@ -599,6 +767,11 @@ def pending_prompts(session_id: str) -> tuple[dict[str, tuple[dict, float]], dic
         return dict(st["perms"]), dict(st["questions"])
 
 
+def prompt_fingerprint(pr: dict) -> str:
+    """Identifies the exact content of a VS Code permission prompt."""
+    return hashlib.sha256(json.dumps(pr, sort_keys=True, default=str).encode()).hexdigest()[:32]
+
+
 def session_busy(session_id: str) -> bool:
     """True while the agent is working on a turn (a new message would be queued, not dropped)."""
     for e in reversed(_events(session_id)):
@@ -650,7 +823,15 @@ def session_cwd(session_id: str) -> str:
     return ""
 
 
-AGENT_HOST_DB = Path(os.environ.get("APPDATA", "")) / "Code" / "User" / "globalStorage" / "agent-host.db"
+def _vscode_user_dir() -> Path:
+    if os.name == "nt":
+        return Path(os.environ.get("APPDATA", "")) / "Code" / "User"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Code" / "User"
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "Code" / "User"
+
+
+AGENT_HOST_DB = _vscode_user_dir() / "globalStorage" / "agent-host.db"
 
 
 def list_vscode_sessions() -> list[dict]:
@@ -766,10 +947,44 @@ def host_policy_keys(session_id: str) -> set[str]:
     return {k for k, src in last.items() if src == "host_policy"}
 
 
-SHELL_TOOLS = {"powershell", "bash", "shell", "run_in_terminal", "write_powershell", "write_bash"}
-WRITE_TOOLS = {"edit", "create", "apply_patch", "str_replace_editor", "write", "multi_edit"}
-URL_TOOLS = {"web_fetch", "fetch", "fetch_webpage"}
-READ_TOOLS = {"view", "grep", "glob", "rg", "read", "read_file"}
+SHELL_TOOLS = {"powershell", "bash", "shell", "run_in_terminal", "write_powershell", "write_bash", "local_shell"}
+WRITE_TOOLS = {"edit", "create", "apply_patch", "str_replace_editor", "write", "multi_edit", "multiedit",
+               "notebookedit"}
+URL_TOOLS = {"web_fetch", "fetch", "fetch_webpage", "webfetch"}
+READ_TOOLS = {"view", "grep", "glob", "rg", "read", "read_file", "ls", "notebookread"}
+_PATCH_FILE = re.compile(r"^\*\*\* (?:(?:Update|Add|Delete) File|Move to): (.+)$", re.M)
+
+
+def _agent_args(tool: str, args: dict) -> dict:
+    """Claude/Codex tool inputs in the shape the rest of the bridge reads (command, fileName, diff)."""
+    t = tool.lower()
+    a = dict(args)
+    cmd = a.get("command")
+    if isinstance(cmd, list):
+        a["command"] = cmd = " ".join(str(x) for x in cmd)
+    if t == "apply_patch" and isinstance(cmd, str):
+        # Every path the patch touches, including "*** Move to:" targets. Only a patch with exactly
+        # one path gets a single target (and so can be covered by "Allow in this session").
+        files = list(dict.fromkeys(f.strip() for f in _PATCH_FILE.findall(cmd)))
+        a.pop("command", None)
+        a.setdefault("diff", cmd)
+        if len(files) == 1:
+            a.setdefault("fileName", files[0])
+        elif files:
+            a.setdefault("intention", f"Edit {len(files)} files")
+            a["files"] = files  # several paths: no single target, so "Allow in this session" isn't offered
+    elif t in ("edit", "multiedit", "write", "notebookedit") and "diff" not in a:
+        edits = a.get("edits") if isinstance(a.get("edits"), list) else [a]
+        lines = []
+        for e in edits:
+            if not isinstance(e, dict):
+                continue
+            for k, mark in (("old_string", "-"), ("new_string", "+"), ("content", "+"), ("new_source", "+")):
+                if isinstance(e.get(k), str):
+                    lines += [mark + ln for ln in e[k].splitlines() or [""]]
+        if lines:
+            a["diff"] = "\n".join(lines)
+    return a
 
 
 def normalize_permission(payload: dict) -> dict:
@@ -781,8 +996,14 @@ def normalize_permission(payload: dict) -> dict:
             args = json.loads(args)
         except ValueError:
             args = {"value": args}
+    if isinstance(args, dict) and "tool_name" in payload:
+        args = _agent_args(tool, args)
     pr = payload.get("permissionRequest") or payload.get("permission_request") or {}
     kind = pr.get("kind") or payload.get("kind") or ""
+    server = pr.get("serverName", "")
+    if tool.startswith("mcp__"):  # Claude/Codex MCP tool: mcp__<server>__<tool>
+        kind = kind or "mcp"
+        server = server or tool.split("__")[1] if tool.count("__") >= 2 else server
     if not kind:
         t = tool.lower()
         if t in SHELL_TOOLS:
@@ -798,7 +1019,7 @@ def normalize_permission(payload: dict) -> dict:
         else:
             kind = "custom-tool"
     merged = {**(args if isinstance(args, dict) else {"value": args}), **pr}
-    return {"kind": kind, "tool": pr.get("toolName") or tool, "args": merged, "server": pr.get("serverName", "")}
+    return {"kind": kind, "tool": pr.get("toolName") or tool, "args": merged, "server": server}
 
 
 def _first(d: dict, *keys: str) -> str:
@@ -852,7 +1073,7 @@ def describe_permission(p: dict, limit: int = 2500) -> tuple[str, bool]:
         why = _inline(_first(a, "intention", "description"))
         return (f"{why}\n" if why else "") + f"```{cmd}```", cut
     if kind == "write":
-        f = _inline(_first(a, "fileName", "path", "file_path", "filePath"), 400)
+        f = _inline(_first(a, "fileName", "path", "file_path", "filePath") or ", ".join(a.get("files") or []), 400)
         diff = _first(a, "diff")
         out = f"`{f}`"
         cut = False
@@ -870,6 +1091,22 @@ def describe_permission(p: dict, limit: int = 2500) -> tuple[str, bool]:
     args = a.get("args", {k: v for k, v in a.items() if k not in ('kind', 'toolCallId', 'toolName', 'toolDescription')})
     shown, cut = _clip(json.dumps(args), limit)
     return f"`{_inline(tool, 80)}`\n```{shown}```", cut
+
+
+def permission_full_text(p: dict) -> tuple[str, str]:
+    """(file name, complete plain text) of an approval, for sending as a file when the message
+    can't show all of it. Nothing is shortened or reformatted."""
+    kind, tool, a = p["kind"], p["tool"], p["args"]
+    if kind == "shell":
+        body = _first(a, "fullCommandText", "command", "cmd", "value")
+        return "command.txt", f"{tool or 'shell'} command:\n\n{body}\n"
+    if kind == "write":
+        files = a.get("files") or [_first(a, "fileName", "path", "file_path", "filePath")]
+        return "changes.txt", "File(s):\n" + "\n".join(f"  {f}" for f in files) + "\n\n" + _first(a, "diff") + "\n"
+    args = a.get("args", {k: v for k, v in a.items() if k not in ('kind', 'toolCallId', 'toolName', 'serverName',
+                                                                   'toolTitle', 'readOnly', 'toolDescription')})
+    return "arguments.txt", f"{tool}" + (f" ({p.get('server')})" if p.get("server") else "") + \
+        " arguments:\n\n" + json.dumps(args, indent=2, ensure_ascii=False) + "\n"
 
 
 def _under(path: str, root: str) -> bool:
@@ -1041,6 +1278,7 @@ class Bridge:
         self.question_for: dict[str, dict] = {}  # session -> ask_user args converted to a chat question
         self.recent_local: dict[str, float] = {}
         self.paused = False
+        self.snooze_until = 0.0
         self.stop_event = threading.Event()
         self.idle = idle_seconds
         self.vs_lookup = vscode_sessions_for_cwd
@@ -1051,6 +1289,9 @@ class Bridge:
         self.active: dict | None = self._load_state().get("active_session")
         self.native_seen: set[str] = set()
         self.native_grace = float(cfg.get("push_after_seconds", 60))
+        self.turn_grace = float(cfg.get("turn_end_after_seconds", 300))
+        self.nonces: dict[str, float] = {}  # signed-request nonces already used (replay protection)
+        self.guards: dict[int, dict] = {}  # job id -> the exact VS Code prompt a button press is for
         self.scan_interval, self.press_timeout = 5.0, 5.0
         # Jobs for the companion VS Code extension (it long-polls /vscode/jobs).
         self.jobs: list[dict] = []
@@ -1076,6 +1317,30 @@ class Bridge:
     def _max_wait_minutes(self) -> float:
         return float(self.cfg.get("max_wait_hours", 168)) * 60
 
+    def mute_reason(self) -> str:
+        """Why the phone is quiet right now ('' = it isn't)."""
+        if self.paused:
+            return "paused"
+        if self.snooze_until > time.time():
+            return "snoozed until " + datetime.fromtimestamp(self.snooze_until).strftime("%H:%M")
+        if in_quiet_hours(str(self.cfg.get("quiet_hours") or "")):
+            return f"quiet hours ({self.cfg['quiet_hours']})"
+        return ""
+
+    def muted(self) -> bool:
+        return bool(self.mute_reason())
+
+    def use_nonce(self, nonce: str, ts: float) -> bool:
+        """False if this signed request was already seen (a replay)."""
+        now = time.time()
+        with self.plock:
+            if len(self.nonces) > 2000 or any(t < now - 2 * AUTH_WINDOW for t in list(self.nonces.values())[:50]):
+                self.nonces = {n: t for n, t in self.nonces.items() if t > now - 2 * AUTH_WINDOW}
+            if nonce in self.nonces:
+                return False
+            self.nonces[nonce] = ts
+            return True
+
     def _phone_limit(self) -> int:
         """Characters of a command/diff shown on the phone (Telegram allows much longer messages)."""
         return 2500 if self.transport.supports_buttons else 800
@@ -1097,12 +1362,13 @@ class Bridge:
             return self.turn_seq.get(sid) == seq and not user_message_after(sid, stop_at)
 
         def run() -> None:
-            # No new message from you within push_after_seconds: also offer the follow-up on the phone.
+            # No new message from you within turn_end_after_seconds: also offer the follow-up on the phone.
             # If the turn was started from the phone, send the reply right away.
-            if self.stop_event.wait(0 if phone_driven else self.native_grace) or not current():
+            if self.stop_event.wait(0 if phone_driven else self.turn_grace) or not current():
                 return
-            if self.paused:
-                return
+            while self.muted():  # snoozed / quiet hours: send it afterwards if it's still current
+                if self.paused or self.stop_event.wait(30) or not current():
+                    return
             last = last_assistant_message(sid, transcript)
             if len(last) > 900:
                 last = last[:900] + "…"
@@ -1121,11 +1387,16 @@ class Bridge:
         threading.Thread(target=run, daemon=True).start()
 
     # -- VS Code prompts left unanswered while you're away ------------------------
-    def post_job(self, job: dict) -> int:
+    def post_job(self, job: dict, guard: dict | None = None) -> int:
         with self.jobs_cond:
             job = {**job, "id": next(self.job_ids), "created": time.time()}
             self.jobs = [j for j in self.jobs if time.time() - j["created"] < 30] + [job]
             self.last_job_at = time.time()
+            if guard is not None:
+                with self.plock:
+                    live = {j["id"] for j in self.jobs}
+                    self.guards = {k: v for k, v in self.guards.items() if k in live}
+                    self.guards[job["id"]] = dict(guard)
             self.jobs_cond.notify_all()
             return job["id"]
 
@@ -1216,9 +1487,17 @@ class Bridge:
             self.helper_id = None
             log.info("companion extension not connected: opening a minimized VS Code window")
             try:
-                subprocess.Popen(["powershell", "-NoProfile", "-Command",
-                                  "Start-Process -FilePath (Get-Command code).Source -ArgumentList '-n' -WindowStyle Minimized"],
-                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                if os.name == "nt":
+                    subprocess.Popen(["powershell", "-NoProfile", "-Command",
+                                      "Start-Process -FilePath (Get-Command code).Source -ArgumentList '-n' -WindowStyle Minimized"],
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                else:
+                    code = shutil.which("code")
+                    if not code:
+                        log.error("could not start VS Code: the 'code' command isn't on PATH")
+                        return False
+                    subprocess.Popen([code, "-n"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, start_new_session=True)
             except OSError as e:
                 log.error("could not start VS Code: %s", e)
                 return False
@@ -1229,35 +1508,78 @@ class Bridge:
             time.sleep(1)
         return False
 
-    def press_vscode(self, sid: str, rid: str, cwd: str, command: str) -> str:
-        """Press Accept/Skip on the VS Code prompt `rid`. Returns '' on success, else a reason."""
+    def press_vscode(self, sid: str, rid: str, cwd: str, command: str, fp: str = "") -> str:
+        """Press Accept/Skip on the VS Code prompt `rid`. Returns '' on success, else a reason.
+
+        The press is tied to that one prompt: right before VS Code runs it, the helper extension
+        asks the bridge (/vscode/guard) to confirm `rid` is still waiting, unchanged, and the only
+        prompt in its session. Otherwise nothing is pressed, so a phone Allow can never land on a
+        different prompt."""
         if not self.ensure_companion():
             return "the companion VS Code window couldn't be started"
         if len(self._waiting_runtime_sessions(cwd)) > 1:
             return "several sessions in this folder are waiting, so it isn't clear which prompt to press"
+        problem = self.guard_problem({"sid": sid, "rid": rid, "fp": fp, "cwd": cwd})
+        if problem:
+            return problem
         vs = self.vs_lookup(cwd)
         resources = session_resources(vs, sid)
+        jid = -1
 
         def done() -> bool:
             return rid not in pending_prompts(sid)[0]
+
+        def refused() -> str:
+            with self.plock:
+                return self.guards.get(jid, {}).get("refused", "")
 
         def wait_done(seconds: float) -> bool:
             end = time.time() + seconds
             while time.time() < end:
                 if done():
                     return True
+                if refused():
+                    break
                 time.sleep(0.3)
             return done()
 
         # The companion window must have the session open before Accept/Skip can reach it.
         for s in vs[:3] or [None]:
-            job = {"command": command, "resources": resources}
+            job = {"command": command, "resources": resources, "guarded": True}
             if s:
                 job["open"] = f"agent-host-session://ahp-session/{s['id']}"
-            self.post_job(job)
+            jid = self.post_job(job, guard={"sid": sid, "rid": rid, "fp": fp, "cwd": cwd})
             if wait_done(self.press_timeout + 15):  # a freshly opened window can take a while
                 return ""
+            if refused():
+                return refused()
         return "" if wait_done(5) else "VS Code didn't accept the button press"
+
+    def guard_problem(self, g: dict) -> str:
+        """'' if the VS Code prompt in `g` may be pressed now, else why not."""
+        perms = pending_prompts(g["sid"])[0]
+        if g["rid"] not in perms:
+            return "that prompt is no longer waiting in VS Code"
+        if g.get("fp") and prompt_fingerprint(perms[g["rid"]][0]) != g["fp"]:
+            return "that prompt changed in VS Code"
+        if len(perms) > 1:
+            return "several prompts are waiting in that session, so it isn't clear which one to press"
+        if g.get("cwd") and len(self._waiting_runtime_sessions(g["cwd"])) > 1:
+            return "several sessions in this folder are waiting, so it isn't clear which prompt to press"
+        return ""
+
+    def check_guard(self, job_id: int) -> dict:
+        """Called by the helper extension right before it presses Accept/Skip for a job."""
+        with self.plock:
+            g = self.guards.get(job_id)
+        if not g:
+            return {"ok": False, "reason": "unknown job"}
+        problem = self.guard_problem(g)
+        if problem:
+            with self.plock:
+                g.setdefault("refused", problem)
+            log.info("job %s: press refused (%s)", job_id, problem)
+        return {"ok": not problem, "reason": problem}
 
     def submit_vscode(self, sid: str, cid: str, cwd: str, text: str) -> str:
         """Answer an open question form by sending `text` to the session. '' on success."""
@@ -1321,11 +1643,12 @@ class Bridge:
         p = normalize_permission({"toolName": pr.get("toolName", ""), "permissionRequest": pr})
         gkey = grant_key(p)
         grant_ok = session_grant_ok(p, cwd, self.cfg["sensitive_write_globs"])
-        detail, cut = describe_permission(p, self._phone_limit())
+        detail, footer, meta = self.approval_parts(p, grant_ok)
         detail += context_block(*request_context(sid, str(pr.get("toolCallId") or "")))
-        req = self.ask("approval", sid, session_title(sid, cwd), detail, self.approval_footer(cut, not grant_ok),
+        fp = prompt_fingerprint(pr)
+        req = self.ask("approval", sid, session_title(sid, cwd), detail, footer,
                        self._max_wait_minutes(), ["Allow once", "Allow for session", "Deny"],
-                       meta={"no_allow": cut, "no_session": not grant_ok}, heading=permission_heading(p),
+                       meta=meta, heading=permission_heading(p),
                        still_pending=lambda: rid in pending_prompts(sid)[0], release_on_return=False)
         r = req.result or {}
         d = r.get("decision")
@@ -1333,7 +1656,7 @@ class Bridge:
         if d not in ("allow", "session", "deny", "stop"):
             return
         problem = self.press_vscode(sid, rid, cwd, "workbench.action.chat.acceptTool" if d in ("allow", "session")
-                                    else "workbench.action.chat.skipTool")
+                                    else "workbench.action.chat.skipTool", fp)
         log.info("#%s press in VS Code: %s", req.id, problem or "ok")
         if problem:
             self.send(f"⚠️ #{req.id}: couldn't answer it in VS Code ({problem}). Please answer it on the laptop.")
@@ -1344,8 +1667,8 @@ class Bridge:
             self.send(f"ℹ️ #{req.id} was skipped. VS Code prompts can't carry feedback text to the agent.")
 
     def scan_once(self) -> None:
-        if self.paused or not self.transport.configured:
-            return
+        if self.muted() or not self.transport.configured:
+            return  # prompts still waiting once notifications are back on are sent then
         try:
             dirs = [d for d in SESSION_STATE.iterdir() if d.is_dir()]
         except OSError:
@@ -1588,13 +1911,30 @@ class Bridge:
             return [[(o[:60], f"#{i} {n}")] for n, o in enumerate(p.options[:10], 1)] or None
         return [[("End turn", f"#{i} ok")]]
 
-    def approval_footer(self, no_allow: bool, no_session: bool) -> str:
+    def approval_footer(self, no_allow: bool, no_session: bool, attached: bool = False) -> str:
+        if attached:
+            return ("📎 Too long to show here, so the complete text is in the file above. "
+                    "Open it and read all of it before tapping Allow.")
         if no_allow:
             return "⚠️ Part of this isn't shown here, so it can only be skipped from the phone. Check it in VS Code to allow it."
         if self.transport.supports_buttons:
             return ""  # the buttons say it all; typing a reply denies with feedback (see /help)
         return ("Reply *1* allow" + ("" if no_session else " · *2* allow in this session")
                 + " · *3* skip · *stop* skip & stop agent, or type feedback to skip.")
+
+    def approval_parts(self, p: dict, grant_ok: bool) -> tuple[str, str, dict]:
+        """(text, footer, meta) for an approval card. A command/diff too long for the message is
+        sent in full as a file (where the transport supports it) so it can still be allowed."""
+        detail, cut = describe_permission(p, self._phone_limit())
+        meta: dict = {"no_allow": cut, "no_session": not grant_ok}
+        footer = self.approval_footer(cut, not grant_ok)
+        if cut and self.transport.supports_documents:
+            name, full = permission_full_text(p)
+            data = full.encode("utf-8")
+            if len(data) <= ATTACH_MAX:
+                meta.update(no_allow=False, attachment=(name, data), fallback_footer=footer)
+                footer = self.approval_footer(False, not grant_ok, attached=True)
+        return detail, footer, meta
 
     def question_footer(self, options: list[str]) -> str:
         if self.transport.supports_buttons:
@@ -1618,9 +1958,18 @@ class Bridge:
         with self.plock:
             self.pending[p.id] = p
         deadline = time.time() + max(1.0, wait_minutes * 60)
-        buttons = self._buttons(p) if self.transport.supports_buttons else None
 
         def deliver(escalated: bool) -> None:
+            nonlocal footer
+            att = p.meta.get("attachment")
+            if att:
+                # Too long for a message: send everything as a file first. If that fails, the
+                # request falls back to "can only be skipped from the phone".
+                if not self.transport.send_document(att[0], att[1], f"#{p.id} · complete text, read before allowing"):
+                    with p.lock:
+                        p.meta["no_allow"] = True
+                    footer = p.meta.get("fallback_footer", footer)
+            buttons = self._buttons(p) if self.transport.supports_buttons else None
             head = f"*{heading}*\n" if heading else ""
             body = f"{head}{SUB_OPEN}{title} · #{p.id}{SUB_CLOSE}" + (f"\n\n{text.strip()}" if text.strip() else "") \
                 + (f"\n\n{footer}" if footer else "")
@@ -1756,18 +2105,34 @@ class Bridge:
                 self.send("Usage: /prompt <what the agent should do>")
             return
         if low in ("status", "list", "pending"):
+            why = self.mute_reason()
+            mode = f"🔕 {why}" if why else "▶️ on"
             if not pend:
-                self.send(f"Nothing pending. Remote mode: {'⏸️ paused' if self.paused else '▶️ on'}.")
+                self.send(f"Nothing pending. Phone notifications: {mode}.")
             else:
-                self.send("Pending:\n" + "\n".join(f"#{x.id} {x.kind} — {x.title}" for x in pend))
+                self.send("Pending:\n" + "\n".join(f"#{x.id} {x.kind} — {x.title}" for x in pend)
+                          + f"\n\nPhone notifications: {mode}.")
             return
         if low == "pause":
             self.paused = True
             self.send("⏸️ Paused. New requests stay on the laptop only. Send *resume* to re-enable.")
             return
+        if low == "snooze":
+            arg = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
+            secs = parse_duration(arg)
+            if secs is None or secs <= 0 or secs > 7 * 86400:
+                self.send("Usage: /snooze 30m · /snooze 2h · /snooze 1d (default 1 hour). /resume ends it early.")
+                return
+            self.snooze_until = time.time() + secs
+            until = datetime.fromtimestamp(self.snooze_until).strftime("%H:%M" if secs < 86400 else "%a %H:%M")
+            self.send(f"🔕 Snoozed until {until}. Anything still waiting then comes to the phone. /resume to end it now.")
+            return
         if low == "resume":
             self.paused = False
-            self.send("▶️ Resumed. Requests will come to your phone and the laptop.")
+            self.snooze_until = 0.0
+            quiet = in_quiet_hours(str(self.cfg.get("quiet_hours") or ""))
+            self.send("▶️ Resumed. Requests will come to your phone and the laptop."
+                      + (f" (Quiet hours {self.cfg['quiet_hours']} are on right now; they still apply.)" if quiet else ""))
             return
         if not pend:
             if self.active:
@@ -1807,6 +2172,9 @@ class Bridge:
                 f.write(json.dumps({"event": event, "payload": payload})[:4000] + "\n")
         if self.paused:
             return {}
+        agent, _, name = event.rpartition("/")
+        if agent in ("claude", "codex"):
+            return self.handle_agent_hook(agent, name, payload)
         handler = {
             "permissionRequest": self.on_permission,
             "preToolUse": self.on_pre_tool,
@@ -1837,14 +2205,14 @@ class Bridge:
                 return {}
         if key in host_policy_keys(sid):
             return {}  # VS Code is already auto-approving this in the session
-        if self._at_laptop():
+        if self._at_laptop() or self.muted():
             return {}  # you're using the laptop: VS Code shows its normal prompt (scanner covers walk-aways)
-        detail, cut = describe_permission(p, self._phone_limit())
+        detail, footer, meta = self.approval_parts(p, grant_ok)
         detail += context_block(*request_context(sid))
         title = session_title(sid, cwd)
-        req = self.ask("approval", sid, title, detail, self.approval_footer(cut, not grant_ok),
+        req = self.ask("approval", sid, title, detail, footer,
                        self.cfg["approval_wait_minutes"], ["Allow once", "Allow for session", "Deny"],
-                       meta={"no_allow": cut, "no_session": not grant_ok}, heading=permission_heading(p))
+                       meta=meta, heading=permission_heading(p))
         r = req.result or {}
         if r.get("timeout") or r.get("decision") == "vscode":
             return {}
@@ -1875,7 +2243,7 @@ class Bridge:
                 args = {"question": args}
         cwd = payload.get("cwd", "")
         if (self.cfg.get("questions_via_chat") and float(self.cfg.get("turn_hold_minutes", 0)) > 0
-                and not self.cfg.get("hold_in_hook") and not self.cfg.get("laptop_popup") and not self.paused):
+                and not self.cfg.get("hold_in_hook") and not self.cfg.get("laptop_popup") and not self.muted()):
             with self.plock:
                 self.question_for[sid] = args
             return {
@@ -1885,7 +2253,7 @@ class Bridge:
                     "(list any options as a numbered list) and then end your turn. The user will reply in the "
                     "chat or from their phone; treat that reply as their answer."),
             }
-        if self._at_laptop():
+        if self._at_laptop() or self.muted():
             return {}  # you're using the laptop: VS Code shows its normal question form
         heading, text, options = question_card(args)
         text = (self._numbered(text, options) + context_block(request_context(sid)[0], "")).strip("\n")
@@ -1909,7 +2277,7 @@ class Bridge:
                 return self._hold_turn(payload)
             self._start_turn_watch(payload)
             return {}
-        if self._at_laptop():
+        if self._at_laptop() or self.muted():
             return {}  # you're at the laptop and can see the result yourself
         sid = payload.get("sessionId") or payload.get("session_id") or ""
         if not payload.get("stop_hook_active"):
@@ -1958,7 +2326,7 @@ class Bridge:
                 return {}
             if self.stop_event.wait(1):
                 return {}
-        if self.paused or not self.transport.configured:
+        if self.muted() or not self.transport.configured:
             return {}
         title = session_title(sid, cwd)
         last = last_assistant_message(sid, payload.get("transcriptPath") or payload.get("transcript_path"))
@@ -1985,6 +2353,89 @@ class Bridge:
     def on_notification(self, payload: dict) -> dict:
         return {}  # unanswered VS Code prompts are picked up by scan_loop from the session logs
 
+    # -- Claude and Codex agents (both use PermissionRequest / Stop hooks in the same format) --------
+    def handle_agent_hook(self, agent: str, event: str, payload: dict) -> dict:
+        if event == "PermissionRequest":
+            return self.on_agent_permission(agent, payload)
+        if event == "Stop":
+            return self.on_agent_turn_end(agent, payload)
+        return {}
+
+    def _agent_away(self) -> bool:
+        """These agents' prompts can't be pressed from outside once shown, so their hook holds a
+        request for the phone only while you're away from the laptop (no keyboard/mouse input for
+        away_after_seconds). Coming back hands it to the normal prompt."""
+        if not self.transport.configured or self.muted():
+            return False
+        return self.idle() >= float(self.cfg.get("away_after_seconds", 60))
+
+    @staticmethod
+    def _agent_title(agent: str, cwd: str) -> str:
+        return f"{AGENT_NAMES.get(agent, agent)} · {Path(cwd).name if cwd else '?'}"
+
+    def on_agent_permission(self, agent: str, payload: dict) -> dict:
+        sid = str(payload.get("session_id") or "")
+        cwd = payload.get("cwd") or ""
+        p = normalize_permission(payload)
+        if p["kind"] == "read" or p["tool"] in self.cfg["passthrough_tools"]:
+            return {}
+        key = f"{agent}:{sid}"
+        gkey = grant_key(p)
+        grant_ok = session_grant_ok(p, cwd, self.cfg["sensitive_write_globs"])
+
+        def out(behavior: str, message: str = "", interrupt: bool = False) -> dict:
+            d: dict[str, Any] = {"behavior": behavior}
+            if message:
+                d["message"] = message
+            if interrupt and agent == "claude":  # Codex rejects "interrupt"
+                d["interrupt"] = True
+            return {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": d}}
+
+        if sid and grant_ok and gkey in self.session_allow.get(key, set()):
+            return out("allow")
+        if not self._agent_away():
+            return {}  # you're at the laptop: the agent shows its normal prompt
+        detail, footer, meta = self.approval_parts(p, grant_ok)
+        req = self.ask("approval", key, self._agent_title(agent, cwd), detail, footer,
+                       self.cfg["approval_wait_minutes"], ["Allow once", "Allow for session", "Deny"],
+                       meta=meta, heading=permission_heading(p))
+        r = req.result or {}
+        log.info("#%s (%s permission in %s) resolved: %s by %s", req.id, agent, sid[:8], r, req.answered_by)
+        d = r.get("decision")
+        if r.get("timeout") or d == "vscode" or not d:
+            return {}
+        if d in ("allow", "session"):
+            if d == "session" and grant_ok and sid:
+                self.session_allow.setdefault(key, set()).add(gkey)
+            return out("allow")
+        msg = f"Denied by the user via {req.answered_by}" + (f". The user said: {r['reason']}" if r.get("reason") else "")
+        return out("deny", msg, interrupt=d == "stop")
+
+    def on_agent_turn_end(self, agent: str, payload: dict) -> dict:
+        if not self.cfg.get("notify_turn_end", True) or not self._agent_away():
+            return {}
+        sid = str(payload.get("session_id") or "")
+        key = f"{agent}:{sid}"
+        if not payload.get("stop_hook_active"):
+            self.consecutive_blocks[key] = 0
+        if self.consecutive_blocks.get(key, 0) >= 7:  # both agents cap forced continuations at 8
+            return {}
+        last = _md(str(payload.get("last_assistant_message") or "")).strip()
+        if len(last) > 900:
+            last = last[:900] + "…"
+        req = self.ask("followup", key, self._agent_title(agent, payload.get("cwd") or ""), last,
+                       self.followup_footer(), self.cfg["followup_wait_minutes"],
+                       heading=f"{AGENT_NAMES.get(agent, agent)} finished")
+        r = req.result or {}
+        log.info("#%s (%s turn end in %s) resolved: %s by %s", req.id, agent, sid[:8], r, req.answered_by)
+        if r.get("prompt"):
+            self.consecutive_blocks[key] = self.consecutive_blocks.get(key, 0) + 1
+            return {"decision": "block", "reason": f"The user replied from their phone: {r['prompt']}"}
+        return {}
+
+
+AGENT_NAMES = {"claude": "Claude", "codex": "Codex"}
+
 
 HELP_TEXT = (
     "🔔 *Agent Doorbell*\n"
@@ -1995,7 +2446,8 @@ HELP_TEXT = (
     "Several open? Prefix typed replies with the id: *#4 1*\n\n"
     "Prompt a session from your phone: /sessions, pick one, then just send messages. "
     "/prompt <text> sends a prompt even while requests are open. /session shows the selected one.\n"
-    "Commands: /sessions · /session · /prompt · /status · /pause · /resume · /help"
+    "Commands: /sessions · /session · /prompt · /status · /pause · /snooze · /resume · /help\n"
+    "/snooze 30m (or 2h, 1d) silences the phone for a while; anything still waiting arrives afterwards."
 )
 
 BOT_COMMANDS = [
@@ -2004,6 +2456,7 @@ BOT_COMMANDS = [
     ("prompt", "Send a prompt to the selected session"),
     ("status", "Show open requests"),
     ("pause", "Stop sending requests to the phone"),
+    ("snooze", "Silence the phone for a while, e.g. /snooze 2h"),
     ("resume", "Start sending requests to the phone again"),
     ("help", "How to use this bot"),
 ]
@@ -2025,26 +2478,54 @@ def make_handler(bridge: Bridge) -> type[BaseHTTPRequestHandler]:
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            nonce = getattr(self, "_nonce", "")
+            if nonce:  # proves this answer comes from the real bridge
+                self.send_header("X-Doorbell-Proof", response_proof(token, nonce, data))
             self.end_headers()
             self.wfile.write(data)
 
-        def _authorized(self) -> bool:
-            return secrets.compare_digest(self.headers.get("X-Bridge-Token", ""), token)
+        def _authorized(self, body: bytes = b"") -> bool:
+            """A signed request (current clients), or the raw token (manual/debug use)."""
+            auth, nonce, ts = (self.headers.get(h, "") for h in ("X-Doorbell-Auth", "X-Doorbell-Nonce", "X-Doorbell-Time"))
+            if auth:
+                try:
+                    t = float(ts)
+                except ValueError:
+                    return False
+                if (not re.fullmatch(r"[0-9a-f]{16,64}", nonce) or abs(time.time() - t) > AUTH_WINDOW
+                        or not hmac.compare_digest(_mac(token, "req", self.command, self.path, ts, nonce,
+                                                        body_digest(body)), auth)):
+                    return False
+                if not bridge.use_nonce(nonce, t):
+                    log.warning("rejected a replayed request to %s", self.path[:60])
+                    return False
+                self._nonce = nonce
+                return True
+            legacy = self.headers.get("X-Bridge-Token", "")
+            return bool(legacy) and secrets.compare_digest(legacy, token)
 
         def do_GET(self) -> None:
-            if self.path == "/health":
+            self._nonce = ""
+            url = urllib.parse.urlparse(self.path)
+            q = urllib.parse.parse_qs(url.query)
+            if url.path == "/health":
+                nonce = (q.get("nonce") or [""])[0]
+                if re.fullmatch(r"[0-9a-f]{16,64}", nonce):
+                    self._nonce = nonce
                 self._json(200, {"ok": True, "channel": bridge.transport.name, "paused": bridge.paused,
-                                 "pending": len(bridge.pending), "vscode_extension": bridge.extension_connected})
-            elif self.path.startswith("/vscode/jobs") and self._authorized():
+                                 "muted": bridge.mute_reason(), "pending": len(bridge.pending),
+                                 "vscode_extension": bridge.extension_connected})
+            elif url.path == "/vscode/jobs" and self._authorized():
                 ext_v = self.headers.get("X-Ext-Version") or ""
                 if ext_v != EXT_VERSION:
-                    if ext_v.isdigit() and int(ext_v) >= 3:
-                        self._json(200, {"jobs": [], "last": 0, "close": True})  # outdated copy closes its window
+                    # An outdated copy closes its window only if it's an empty helper window; in a
+                    # window you work in it just idles until VS Code is reloaded.
+                    if ext_v.isdigit() and int(ext_v) >= 3 and (q.get("empty") or ["0"])[0] == "1":
+                        self._json(200, {"jobs": [], "last": 0, "close": True})
                         return
-                    time.sleep(25)  # very old copy: keep it idle and give it nothing to do
+                    time.sleep(25)  # keep it idle and give it nothing to do
                     self._json(200, {"jobs": [], "last": 0})
                     return
-                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 try:
                     after = int((q.get("after") or ["-1"])[0])
                 except ValueError:
@@ -2052,19 +2533,23 @@ def make_handler(bridge: Bridge) -> type[BaseHTTPRequestHandler]:
                 instance = re.sub(r"[^\w-]", "", (q.get("instance") or [""])[0])[:40]
                 self._json(200, bridge.wait_jobs(after, timeout=25, instance=instance,
                                                  empty=(q.get("empty") or ["0"])[0] == "1"))
-            elif self.path == "/debug/outbox" and self._authorized():
+            elif url.path == "/debug/outbox" and self._authorized():
                 self._json(200, bridge.transport.outbox)
             else:
                 self._json(404, {})
 
         def do_POST(self) -> None:
-            if not self._authorized():
+            self._nonce = ""
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length) if length else b""
+            if not self._authorized(body):
                 self._json(403, {"error": "bad token"})
                 return
-            length = int(self.headers.get("Content-Length") or 0)
             try:
-                payload = json.loads(self.rfile.read(length) or b"{}")
+                payload = json.loads(body or b"{}")
             except ValueError:
+                payload = {}
+            if not isinstance(payload, dict):
                 payload = {}
             if self.path.startswith("/hook/"):
                 event = self.path[len("/hook/"):]
@@ -2077,6 +2562,12 @@ def make_handler(bridge: Bridge) -> type[BaseHTTPRequestHandler]:
             elif self.path == "/debug/inbound":
                 bridge.handle_inbound(payload.get("body", ""))
                 self._json(200, {"ok": True})
+            elif self.path == "/vscode/guard":
+                try:
+                    jid = int(payload.get("id"))
+                except (TypeError, ValueError):
+                    jid = -1
+                self._json(200, bridge.check_guard(jid))
             elif self.path == "/vscode/result":
                 log.info("extension job %s: errors=%s info=%s", payload.get("id"),
                          str(payload.get("errors") or [])[:400], json.dumps(payload.get("info") or {})[:600])
@@ -2090,21 +2581,42 @@ def make_handler(bridge: Bridge) -> type[BaseHTTPRequestHandler]:
 
 
 def keep_awake() -> bool:
-    """Ask Windows not to sleep because of inactivity while this thread runs. Released
-    automatically when the process exits. The screen can still turn off and lock."""
-    if os.name != "nt":
+    """Stop the computer from sleeping because of inactivity while this process runs (released
+    automatically when it exits). The screen can still turn off and lock."""
+    if os.name == "nt":
+        es_continuous, es_system_required = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(ctypes.c_uint(es_continuous | es_system_required))
+        return True
+    pid = str(os.getpid())
+    if sys.platform == "darwin" and shutil.which("caffeinate"):
+        cmd = ["caffeinate", "-i", "-w", pid]
+    elif shutil.which("systemd-inhibit"):
+        cmd = ["systemd-inhibit", "--what=idle:sleep", "--who=Agent Doorbell", "--why=Waiting for agent requests",
+               "--mode=block", "sh", "-c", f"while kill -0 {pid} 2>/dev/null; do sleep 30; done"]
+    else:
         return False
-    es_continuous, es_system_required = 0x80000000, 0x00000001
-    ctypes.windll.kernel32.SetThreadExecutionState(ctypes.c_uint(es_continuous | es_system_required))
-    return True
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except OSError:
+        return False
 
 
 _MUTEXES: list[Any] = []
 
 
 def single_instance(name: str) -> bool:
-    """False if another process already holds the named Windows mutex."""
+    """False if another process already holds this named lock (a Windows mutex, or a lock file)."""
     if os.name != "nt":
+        import fcntl
+        path = HERE / f".{re.sub(r'[^A-Za-z0-9]', '_', name)}.lock"
+        f = open(path, "w")
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            f.close()
+            return False
+        _MUTEXES.append(f)  # keep it for the life of the process
         return True
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.CreateMutexW.restype = ctypes.c_void_p
@@ -2125,6 +2637,7 @@ class Supervisor:
     def __init__(self, cfg: dict, start: Callable[[bool], Any] | None = None,
                  healthy: Callable[[], bool] | None = None) -> None:
         self.port = int(cfg["port"])
+        self.token = str(cfg.get("token") or "")
         self.start = start or self._start_child
         self.healthy = healthy or self._healthy
         self.child: Any = None
@@ -2135,11 +2648,9 @@ class Supervisor:
         self.seen_running = False
 
     def _healthy(self) -> bool:
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=5) as r:
-                return json.loads(r.read().decode() or "{}").get("ok") is True
-        except Exception:
-            return False
+        # Only the real bridge can sign its answer, so another program on the port isn't
+        # mistaken for a healthy bridge.
+        return (verified_health(self.port, self.token) or {}).get("ok") is True
 
     @staticmethod
     def _start_child(restarted: bool) -> subprocess.Popen:
@@ -2201,7 +2712,15 @@ def supervise(cfg: dict) -> None:
 
 def serve(cfg: dict) -> None:
     bridge = Bridge(cfg)
-    server = ThreadingHTTPServer(("127.0.0.1", int(cfg["port"])), make_handler(bridge))
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", int(cfg["port"])), make_handler(bridge))
+    except OSError as e:
+        log.error("can't listen on 127.0.0.1:%s (%s)", cfg["port"], e)
+        if bridge.transport.configured and not os.environ.get("AGENT_DOORBELL_RESTARTED"):
+            bridge.transport.send(f"⚠️ Agent Doorbell couldn't start: another program is using port {cfg['port']}. "
+                                  "Hooks and VS Code won't talk to it (they check it's the real bridge). "
+                                  "Close that program or change \"port\" in config.json, then run the installer again.")
+        raise
     server.daemon_threads = True
     threading.Thread(target=bridge.poll_loop, daemon=True).start()
     threading.Thread(target=bridge.scan_loop, daemon=True).start()
@@ -2286,11 +2805,138 @@ def setup_telegram() -> None:
     sys.exit("Timed out waiting for the /start message. Run setup-telegram again.")
 
 
+def _bare_path(p: Path) -> str | None:
+    """A path that needs no quoting in bash, PowerShell or cmd (forward slashes; on Windows the 8.3
+    short form when it contains spaces). None if there isn't one."""
+    s = str(p)
+    if os.name == "nt" and " " in s:
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetShortPathNameW(s, buf, 1024):
+            s = buf.value
+    s = s.replace("\\", "/")
+    return None if re.search(r"[\s'\"$`&|;()<>]", s) else s
+
+
+def _hook_python() -> Path:
+    exe = Path(sys.executable)
+    if exe.name.lower() == "pythonw.exe":  # hooks need stdout
+        exe = exe.with_name("python.exe")
+    return exe
+
+
+def _agent_handler(event: str, timeout: int, agent: str) -> dict:
+    py, hook = _hook_python(), HERE / "hook.py"
+    arg = f"{agent}/{event}"
+    bare_py, bare_hook = _bare_path(py), _bare_path(hook)
+    if bare_py and bare_hook:
+        h: dict[str, Any] = {"type": "command", "command": f"{bare_py} {bare_hook} {arg}"}
+    elif os.name != "nt":
+        import shlex
+        h = {"type": "command", "command": f"{shlex.quote(str(py))} {shlex.quote(str(hook))} {arg}"}
+    else:  # exec form: no shell, so no quoting needed
+        h = {"type": "command", "command": str(py), "args": [str(hook), arg]}
+    h["timeout"] = timeout
+    return h
+
+
+def _is_ours(handler: dict) -> bool:
+    text = " ".join([str(handler.get("command", ""))] + [str(a) for a in handler.get("args") or []])
+    return "hook.py" in text and bool(re.search(r"\b(claude|codex)/(PermissionRequest|Stop)\b", text))
+
+
+def _merge_agent_hooks(path: Path, agent: str, cfg: dict, remove: bool) -> str:
+    """Add (or remove) Agent Doorbell's PermissionRequest/Stop hooks in a Claude settings.json or
+    Codex hooks.json, keeping everything else in the file as it is."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except ValueError:
+        return f"skipped {path}: it isn't valid JSON"
+    if not isinstance(data, dict):
+        return f"skipped {path}: unexpected format"
+    hooks = data.get("hooks") if isinstance(data.get("hooks"), dict) else {}
+    for event in list(hooks):
+        groups = []
+        for g in hooks[event] if isinstance(hooks[event], list) else []:
+            if isinstance(g, dict) and isinstance(g.get("hooks"), list):
+                g = {**g, "hooks": [h for h in g["hooks"] if not (isinstance(h, dict) and _is_ours(h))]}
+                if not g["hooks"]:
+                    continue
+            groups.append(g)
+        if groups:
+            hooks[event] = groups
+        else:
+            hooks.pop(event)
+    if not remove:
+        approval = int(float(cfg.get("approval_wait_minutes", 60)) * 60 + 120)
+        followup = int(float(cfg.get("followup_wait_minutes", 10)) * 60 + 120)
+        hooks.setdefault("PermissionRequest", []).append(
+            {"matcher": "*" if agent == "claude" else ".*", "hooks": [_agent_handler("PermissionRequest", approval, agent)]})
+        hooks.setdefault("Stop", []).append({"hooks": [_agent_handler("Stop", followup, agent)]})
+    if hooks:
+        data["hooks"] = hooks
+    else:
+        data.pop("hooks", None)
+    if remove and not path.exists():
+        return ""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return f"{'removed from' if remove else 'written'}: {path}"
+
+
+def install_hooks(cfg: dict, remove: bool = False) -> list[str]:
+    """Write (or remove) the hooks for Copilot, and for Claude and Codex where they're installed."""
+    out = []
+    copilot_dir = COPILOT_HOME / "hooks"
+    copilot_file = copilot_dir / "agent-doorbell.json"
+    for old in ("whatsapp-hitl.json",):  # name used by older versions
+        (copilot_dir / old).unlink(missing_ok=True)
+    if remove:
+        if copilot_file.exists():
+            copilot_file.unlink()
+            out.append(f"removed: {copilot_file}")
+    else:
+        py, hook = _hook_python(), HERE / "hook.py"
+
+        def entry(evt: str, timeout: int, matcher: str = "") -> list[dict]:
+            e: dict[str, Any] = {"type": "command"}
+            if os.name == "nt":
+                e["powershell"] = f"& '{py}' '{hook}' {evt}"
+            else:
+                import shlex
+                e["bash"] = f"{shlex.quote(str(py))} {shlex.quote(str(hook))} {evt}"
+            e["timeoutSec"] = timeout
+            if matcher:
+                e["matcher"] = matcher
+            return [e]
+
+        m = lambda key: int(float(cfg.get(key, 60)) * 60 + 120)  # noqa: E731
+        doc = {"version": 1, "hooks": {
+            "permissionRequest": entry("permissionRequest", m("approval_wait_minutes")),
+            "preToolUse": entry("preToolUse", m("question_wait_minutes"), "ask_user"),
+            "agentStop": entry("agentStop", m("followup_wait_minutes")),
+            "notification": entry("notification", 30, "permission_prompt|elicitation_dialog"),
+        }}
+        copilot_dir.mkdir(parents=True, exist_ok=True)
+        copilot_file.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        out.append(f"Copilot hook written: {copilot_file}")
+    for agent, home, name in (("claude", CLAUDE_HOME, "settings.json"), ("codex", CODEX_HOME, "hooks.json")):
+        if not home.exists():
+            continue  # that agent isn't installed for this user
+        msg = _merge_agent_hooks(home / name, agent, cfg, remove)
+        if msg:
+            out.append(f"{AGENT_NAMES[agent]} hooks {msg}")
+    return out
+
+
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
     # The supervisor logs to its own file so two processes never rotate the same log.
     log_path = HERE / "supervisor.log" if cmd == "supervise" else LOG_PATH
-    handlers: list[logging.Handler] = [logging.handlers.RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=2, encoding="utf-8")]
+    handlers: list[logging.Handler]
+    if cmd in ("health", "install-hooks", "uninstall-hooks"):
+        handlers = [logging.NullHandler()]  # quick commands: don't touch the running bridge's log
+    else:
+        handlers = [logging.handlers.RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=2, encoding="utf-8")]
     if sys.stdout is not None and sys.stdout.isatty():
         handlers.append(logging.StreamHandler())
     logging.basicConfig(level=logging.INFO, handlers=handlers, format="%(asctime)s %(levelname)s %(message)s")
@@ -2300,6 +2946,14 @@ def main() -> None:
         setup_telegram()
     elif cmd == "supervise":
         supervise(load_config())
+    elif cmd in ("install-hooks", "uninstall-hooks"):
+        for line in install_hooks(load_config(), remove=cmd == "uninstall-hooks"):
+            print(line)
+    elif cmd == "health":
+        cfg = load_config()
+        h = verified_health(int(cfg["port"]), cfg["token"])
+        print(json.dumps(h) if h else "not running (or another program is using the port)")
+        sys.exit(0 if h else 1)
     elif cmd == "test-send":
         cfg = load_config()
         b = Bridge(cfg)
