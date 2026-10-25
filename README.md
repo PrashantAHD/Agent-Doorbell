@@ -9,7 +9,7 @@ Approve commands, answer questions, and send prompts from Telegram, without goin
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![VS Code](https://img.shields.io/badge/VS%20Code-Copilot%20agents-007ACC?logo=visualstudiocode&logoColor=white)
 ![Telegram](https://img.shields.io/badge/Telegram-bot-26A5E4?logo=telegram&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-71%20passing-2EA44F)
+![Tests](https://img.shields.io/badge/tests-73%20passing-2EA44F)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 
 [Why](#the-problem-it-solves) · [Features](#features) · [How it works](#how-it-works) · [Quick start](#quick-start) · [Using it](#using-it-from-your-phone) · [Security](#security) · [Reliability](#reliability) · [Limitations](#limitations) · [FAQ](#faq)
@@ -41,19 +41,17 @@ These prompts only appear in VS Code. **If you're away from the laptop, the agen
 
 **What arrives on your phone**
 
-> **[#12]** 📁 billing-api · Fix flaky tests
+> **Run powershell command?**
+> _billing-api · Fix flaky tests · #12_
 >
-> 🧑 You asked: Make the test suite stable in CI
-> 💬 Agent: Running the tests serially to find the flaky one.
->
-> 🖥️ Run powershell command — Run the test suite:
+> Run the test suite
 > ```
 > npm test -- --runInBand
 > ```
-> Tap a button, or type a message to deny with that feedback.
+> ▸ _You asked: Make the test suite stable in CI_ · _Agent: Running the tests serially to find the flaky one._ (collapsed, tap to expand)
 >
-> `✅ Allow once` `🔁 Allow this for session`
-> `❌ Deny` `🛑 Deny & stop agent`
+> `Allow` `Allow in this session`
+> `Skip` `Skip & stop agent`
 
 </td>
 <td width="45%" valign="top">
@@ -149,7 +147,7 @@ This writes the Copilot hook, installs the helper extension, registers the **Age
 
 | On your phone | What it does |
 |---|---|
-| Tap **✅ Allow once** / **🔁 Allow this for session** / **❌ Deny** / **🛑 Deny & stop agent** | Answers an approval. "For session" covers only that exact command, file, site, or tool |
+| Tap **Allow** / **Allow in this session** / **Skip** / **Skip & stop agent** | Answers an approval (Skip = deny). "In this session" covers only that exact command, file, site, or tool |
 | Type any message on an approval | Denies it and passes your message to the agent as feedback |
 | Tap an option, or type an answer | Answers an agent's question |
 | Type a message on a "turn finished" card | Sends it as your next prompt. Tap **👍 End turn** to leave it |
@@ -214,7 +212,7 @@ A security review (Oct 2026) found three ways you could be tricked into approvin
 
 <br>
 
-**The situation:** Anyone who gets your bot token can post messages through your bot and edit its messages. They could edit a real approval so a dangerous command looks harmless, send a fake message with a **❌ Deny** button that actually means "allow", or add a button whose hidden data is a prompt such as "download and run …".
+**The situation:** Anyone who gets your bot token can post messages through your bot and edit its messages. They could edit a real approval so a dangerous command looks harmless, send a fake message with a **Skip** button that actually means "allow", or add a button whose hidden data is a prompt such as "download and run …".
 
 **How you're protected:**
 - Every message's buttons carry a random code that's tied to that one message when it's sent.
@@ -247,7 +245,7 @@ A security review (Oct 2026) found three ways you could be tricked into approvin
 **The situation:** Approving one harmless command (say `git status`) "for the session" used to approve **every** shell command afterwards, and skipped the extra check on sensitive files. A misled agent could ask for something harmless once, then run anything, including writes to `.git/hooks` or `.vscode/tasks.json` that run code later.
 
 **How you're protected:**
-- **🔁 Allow this for session** covers only that exact command, that exact file, that one website, or that one MCP tool.
+- **Allow in this session** covers only that exact command, that exact file, that one website, or that one MCP tool.
 - It isn't offered at all for sensitive files (dotfiles, `.git`, `.vscode`, `package.json`, …) or for files outside the workspace. Those ask every time.
 
 </details>

@@ -211,6 +211,7 @@ class Transport:
 
     def send(self, body: str, buttons: Buttons | None = None) -> Any:
         """Send a message; returns a truthy message reference on success."""
+        body = to_plain(body)
         self.outbox.append(body)
         log.info("[dry-run] %s", body.replace("\n", " | ")[:300])
         return len(self.outbox)
@@ -223,16 +224,37 @@ class Transport:
         return []
 
 
+# Layout markers used in message bodies (private-use characters, stripped from all untrusted text):
+# SUB = small italic subtitle line, MORE = collapsed "tap to expand" section.
+SUB_OPEN, SUB_CLOSE, MORE_OPEN, MORE_CLOSE = "\ue001", "\ue002", "\ue003", "\ue004"
+_MARKS = re.compile("[\ue001-\ue004]")
+
+
+def _unmark(s: str) -> str:
+    return _MARKS.sub("", s or "")
+
+
+def to_plain(s: str) -> str:
+    """Message body for channels without rich formatting (WhatsApp, logs): subtitle in _italics_,
+    collapsed sections as > quotes."""
+    s = re.sub(f"{SUB_OPEN}(.*?){SUB_CLOSE}", lambda m: f"_{m.group(1)}_", s, flags=re.S)
+    s = re.sub(f"{MORE_OPEN}(.*?){MORE_CLOSE}",
+               lambda m: "\n".join("> " + line for line in m.group(1).split("\n")), s, flags=re.S)
+    return _unmark(s)
+
+
 def to_telegram_html(s: str) -> str:
-    """Convert the WhatsApp-style markup used in messages (*bold*, `code`, ```pre```) to Telegram HTML."""
+    """Convert the message markup (*bold*, `code`, ```pre```, subtitle, collapsed section) to Telegram HTML."""
     out = []
     for part in re.split(r"(```.*?```|`[^`\n]+`)", s, flags=re.S):
         if len(part) >= 6 and part.startswith("```") and part.endswith("```"):
-            out.append("<pre>" + html.escape(part[3:-3].strip("\n"), quote=False) + "</pre>")
+            out.append("<pre>" + html.escape(_unmark(part[3:-3]).strip("\n"), quote=False) + "</pre>")
         elif len(part) >= 2 and part.startswith("`") and part.endswith("`"):
-            out.append("<code>" + html.escape(part[1:-1], quote=False) + "</code>")
+            out.append("<code>" + html.escape(_unmark(part[1:-1]), quote=False) + "</code>")
         else:
-            out.append(re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"<b>\1</b>", html.escape(part, quote=False)))
+            t = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"<b>\1</b>", html.escape(part, quote=False))
+            out.append(t.replace(SUB_OPEN, "<i>").replace(SUB_CLOSE, "</i>")
+                        .replace(MORE_OPEN, "<blockquote expandable>").replace(MORE_CLOSE, "</blockquote>"))
     return "".join(out)
 
 
@@ -277,7 +299,7 @@ class TelegramTransport(Transport):
             except RuntimeError as e:
                 if "parse" not in str(e).lower():
                     raise
-                msg = self.call("sendMessage", {**params, "text": body})  # markup problem: send plain
+                msg = self.call("sendMessage", {**params, "text": to_plain(body)})  # markup problem: send plain
             self.last_error = ""
             return msg["message_id"]
         except Exception as e:
@@ -351,6 +373,7 @@ class TwilioTransport(Transport):
             return json.loads(r.read().decode())
 
     def send(self, body: str, buttons: Buttons | None = None) -> Any:
+        body = to_plain(body)
         if len(body) > WA_MAX:
             body = body[: WA_MAX - 1] + "…"
         try:
@@ -416,7 +439,7 @@ def _events(session_id: str, transcript: str | None = None) -> list[dict]:
 
 
 def session_title(session_id: str, cwd: str) -> str:
-    """'📁 folder · title' using the session title VS Code shows (falls back to the first prompt)."""
+    """'folder · title' using the session title VS Code shows (falls back to the first prompt)."""
     folder = Path(cwd).name if cwd else "?"
     name = ""
     try:
@@ -434,7 +457,7 @@ def session_title(session_id: str, cwd: str) -> str:
     name = re.sub(r"\s+", " ", name)
     if len(name) > 60:
         name = name[:57] + "…"
-    return f"📁 {folder}" + (f" · {name}" if name else "")
+    return folder + (f" · {name}" if name else "")
 
 
 def _message_events(session_id: str, max_bytes: int) -> list[dict]:
@@ -488,8 +511,9 @@ def request_context(session_id: str, tool_call_id: str = "") -> tuple[str, str]:
 
 
 def context_block(task: str, say: str) -> str:
-    lines = ([f"🧑 You asked: {task}"] if task else []) + ([f"💬 Agent: {say}"] if say else [])
-    return "\n".join(lines) + "\n\n" if lines else ""
+    """Background for a phone message, as a collapsed section (tap to expand)."""
+    lines = ([f"You asked: {task}"] if task else []) + ([f"Agent: {say}"] if say else [])
+    return f"\n{MORE_OPEN}" + "\n".join(lines) + MORE_CLOSE if lines else ""
 
 
 def _ts(e: dict) -> float:
@@ -683,7 +707,7 @@ def last_assistant_message(session_id: str, transcript: str | None) -> str:
         if e.get("type") == "assistant.message":
             content = (e.get("data") or {}).get("content") or ""
             if content.strip():
-                return content.strip()
+                return _md(content).strip()
     return ""
 
 
@@ -788,7 +812,7 @@ def _first(d: dict, *keys: str) -> str:
 def _clip(s: str, limit: int) -> tuple[str, bool]:
     """Fit text for the phone without hiding anything silently: keeps the start and the end
     with a visible warning in between. Neutralises ``` so the text can't end its code block."""
-    s = (s or "").replace("```", "`\u200b`\u200b`")
+    s = _unmark(s).replace("```", "`\u200b`\u200b`")
     if len(s) <= limit:
         return s, False
     head, tail = s[: limit * 2 // 3], s[-(limit // 3):]
@@ -797,36 +821,55 @@ def _clip(s: str, limit: int) -> tuple[str, bool]:
 
 
 def _inline(s: str, limit: int = 200) -> str:
-    s = re.sub(r"\s+", " ", (s or "").replace("`", "'")).strip()
+    s = re.sub(r"\s+", " ", _unmark(s).replace("`", "'")).strip()
     return s if len(s) <= limit else s[: limit - 1] + "…"
 
 
+def _md(s: str) -> str:
+    """Agent markdown for the phone: **bold** → *bold* (the bridge's bold markup)."""
+    return _unmark(s).replace("**", "*")
+
+
+def permission_heading(p: dict) -> str:
+    """Card title for an approval, worded like VS Code's prompt."""
+    kind, tool, a = p["kind"], _inline(p["tool"], 40).replace("*", ""), p["args"]
+    if kind == "shell":
+        return f"Run {tool or 'shell'} command?"
+    if kind == "write":
+        return f"{_inline(_first(a, 'intention'), 40).replace('*', '') or 'Edit file'}?"
+    if kind == "url":
+        return "Fetch web page?"
+    if kind == "mcp":
+        return f"Run MCP tool {tool}?"
+    return f"Use {tool or 'tool'}?"
+
+
 def describe_permission(p: dict, limit: int = 2500) -> tuple[str, bool]:
-    """Phone text for an approval request, and whether part of it couldn't be shown."""
+    """Phone text for an approval request (under its heading), and whether part of it couldn't be shown."""
     kind, tool, a = p["kind"], p["tool"], p["args"]
     if kind == "shell":
         cmd, cut = _clip(_first(a, "fullCommandText", "command", "cmd", "value"), limit)
         why = _inline(_first(a, "intention", "description"))
-        return f"🖥️ Run {_inline(tool, 40) or 'shell'} command" + (f" — {why}" if why else "") + f":\n```{cmd}```", cut
+        return (f"{why}\n" if why else "") + f"```{cmd}```", cut
     if kind == "write":
         f = _inline(_first(a, "fileName", "path", "file_path", "filePath"), 400)
-        why = _inline(_first(a, "intention"), 80)
         diff = _first(a, "diff")
-        out = f"✏️ {why or 'Edit file'}: `{f}`"
+        out = f"`{f}`"
         cut = False
         if diff:
             shown, cut = _clip(diff.strip(), limit)
             out += f"\n```{shown}```"
         return out, cut
     if kind == "url":
-        return f"🌐 Fetch URL: {_inline(_first(a, 'url', 'value'), 500)}", False
+        return _inline(_first(a, "url", "value"), 500), False
     if kind == "mcp":
         args = a.get("args", {k: v for k, v in a.items() if k not in ('kind', 'toolCallId', 'toolName', 'serverName', 'toolTitle', 'readOnly')})
         shown, cut = _clip(json.dumps(args), limit)
-        return f"🔌 MCP tool `{_inline(tool, 80)}` ({_inline(p.get('server') or a.get('serverName', ''), 80)}):\n```{shown}```", cut
+        server = _inline(p.get("server") or a.get("serverName", ""), 80)
+        return f"`{_inline(tool, 80)}`" + (f" · {server}" if server else "") + f"\n```{shown}```", cut
     args = a.get("args", {k: v for k, v in a.items() if k not in ('kind', 'toolCallId', 'toolName', 'toolDescription')})
     shown, cut = _clip(json.dumps(args), limit)
-    return f"🔧 Tool `{_inline(tool, 80)}`:\n```{shown}```", cut
+    return f"`{_inline(tool, 80)}`\n```{shown}```", cut
 
 
 def _under(path: str, root: str) -> bool:
@@ -863,7 +906,46 @@ def format_question(args: dict) -> tuple[str, list[str]]:
             if len(props) == 1:
                 options = [str(x) for x in labels]
         lines.append(line)
-    return "\n".join(lines).strip(), options
+    return _unmark("\n".join(lines).strip()), options
+
+
+def question_card(args: dict) -> tuple[str, str, list[str]]:
+    """(heading, body, options) for an agent question, laid out like VS Code's question card:
+    the question as the title, the explanation underneath, options as buttons (listed once)."""
+    q = _md(_first(args, "question", "message", "prompt")).strip()
+    options = [str(c if isinstance(c, str) else _first(c, "label", "title", "value"))
+               for c in args.get("choices") or args.get("options") or []]
+    props = (args.get("requestedSchema") or {}).get("properties") or {}
+    body: list[str] = []
+    if len(props) == 1:
+        name, f = next(iter(props.items()))
+        vals = f.get("enum") or [o.get("const") for o in f.get("oneOf", [])] or (f.get("items") or {}).get("enum") or []
+        labels = f.get("enumNames") or [o.get("title") for o in f.get("oneOf", [])] or vals
+        options = [str(x) for x in labels] or options
+        heading = _md(f.get("title") or "").strip() or q or name
+        if q and q != heading:
+            body.append(q)
+        if f.get("description"):
+            body.append(_md(f["description"]))
+    elif props:
+        heading = q or "A few questions"
+        for name, f in props.items():
+            vals = f.get("enum") or [o.get("const") for o in f.get("oneOf", [])] or (f.get("items") or {}).get("enum") or []
+            labels = f.get("enumNames") or [o.get("title") for o in f.get("oneOf", [])] or vals
+            line = f"• *{_inline(f.get('title') or name, 80).replace('*', '')}*"
+            if f.get("description"):
+                line += f" — {_inline(f['description'], 200)}"
+            if labels:
+                line += f" ({' / '.join(_inline(str(x), 40) for x in labels)})"
+            body.append(line)
+        options = []
+    else:
+        heading = q or "Question"
+    if len(heading) > 120:  # long questions go in the body, with a short title
+        body.insert(0, heading)
+        heading = "Question"
+    text = _clip("\n\n".join(body), 1500)[0] if body else ""
+    return _inline(heading, 120).replace("*", ""), text, options
 
 
 # ----------------------------------------------------------------------------
@@ -897,15 +979,15 @@ class Pending:
 
 def outcome_label(kind: str, result: dict, by: str) -> str:
     if result.get("timeout"):
-        return "⌛ No reply: turn ended" if kind == "followup" else "⌛ Timed out → VS Code prompt"
+        return "No reply: turn ended" if kind == "followup" else "Timed out: answer in VS Code"
     if kind == "approval":
         d = result.get("decision", "")
-        label = {"allow": "✅ Allowed once", "session": "🔁 Allowed for session", "deny": "❌ Denied",
-                 "stop": "🛑 Denied & stopped", "vscode": "💻 Sent to VS Code prompt"}.get(d, d)
+        label = {"allow": "✓ Allowed", "session": "✓ Allowed in this session", "deny": "✕ Skipped",
+                 "stop": "✕ Skipped & stopped", "vscode": "Sent to VS Code"}.get(d, d)
     elif kind == "question":
-        label = "💻 Answering in VS Code" if result.get("vscode") else f"✅ {result.get('text', '')}"[:45]
+        label = "Answering in VS Code" if result.get("vscode") else f"✓ {result.get('text', '')}"[:45]
     else:
-        label = "▶️ Follow-up sent" if result.get("prompt") else "👍 Turn ended"
+        label = "✓ Follow-up sent" if result.get("prompt") else "✓ Turn ended"
     return label + (" · laptop" if by == "laptop" else "")
 
 
@@ -1025,11 +1107,9 @@ class Bridge:
             if len(last) > 900:
                 last = last[:900] + "…"
             task = request_context(sid)[0]
-            req = self.ask("followup", sid, session_title(sid, cwd),
-                           context_block(task, "") + f"✅ Agent finished its turn.\n\n{last}",
-                           "💬 Type a follow-up prompt to continue, or " +
-                           ("tap *End turn*." if self.transport.supports_buttons else "reply *ok* to end."),
-                           self._max_wait_minutes(), still_pending=current, release_on_return=False)
+            req = self.ask("followup", sid, session_title(sid, cwd), last + context_block(task, ""),
+                           self.followup_footer(), self._max_wait_minutes(), heading="Agent finished",
+                           still_pending=current, release_on_return=False)
             r = req.result or {}
             log.info("#%s (turn end in %s) resolved: %s by %s", req.id, sid[:8], r, req.answered_by)
             if r.get("prompt"):
@@ -1221,16 +1301,12 @@ class Bridge:
 
     def handle_native_question(self, sid: str, cid: str, args: dict) -> None:
         cwd = session_cwd(sid)
-        text, options = format_question(args)
+        heading, text, options = question_card(args)
         task, _ = request_context(sid, cid)
-        text = context_block(task, "") + "❓ " + text
-        if options:
-            text += "\n\n" + "\n".join(f"*{i}.* {o}" for i, o in enumerate(options, 1))
-        footer = "🖥️ This question is waiting in VS Code. " + (
-            "Tap an option or type your answer." if options and self.transport.supports_buttons
-            else "Reply with your answer" + (" (option number or text)." if options else "."))
-        req = self.ask("question", sid, session_title(sid, cwd), text, footer, self._max_wait_minutes(),
-                       options, still_pending=lambda: cid in pending_prompts(sid)[1], release_on_return=False)
+        text = self._numbered(text, options) + context_block(task, "")
+        req = self.ask("question", sid, session_title(sid, cwd), text.strip("\n"), self.question_footer(options),
+                       self._max_wait_minutes(), options, heading=heading,
+                       still_pending=lambda: cid in pending_prompts(sid)[1], release_on_return=False)
         r = req.result or {}
         log.info("#%s (VS Code question %s in %s) resolved: %s by %s", req.id, cid[:8], sid[:8], r, req.answered_by)
         if not r.get("text"):
@@ -1246,11 +1322,10 @@ class Bridge:
         gkey = grant_key(p)
         grant_ok = session_grant_ok(p, cwd, self.cfg["sensitive_write_globs"])
         detail, cut = describe_permission(p, self._phone_limit())
-        detail = context_block(*request_context(sid, str(pr.get("toolCallId") or ""))) + detail
-        footer = "🖥️ This is waiting in VS Code. " + self.approval_footer(cut, not grant_ok)
-        req = self.ask("approval", sid, session_title(sid, cwd), detail, footer,
+        detail += context_block(*request_context(sid, str(pr.get("toolCallId") or "")))
+        req = self.ask("approval", sid, session_title(sid, cwd), detail, self.approval_footer(cut, not grant_ok),
                        self._max_wait_minutes(), ["Allow once", "Allow for session", "Deny"],
-                       meta={"no_allow": cut, "no_session": not grant_ok},
+                       meta={"no_allow": cut, "no_session": not grant_ok}, heading=permission_heading(p),
                        still_pending=lambda: rid in pending_prompts(sid)[0], release_on_return=False)
         r = req.result or {}
         d = r.get("decision")
@@ -1466,7 +1541,7 @@ class Bridge:
     def _launch_popup(self, p: Pending) -> subprocess.Popen | None:
         if not self.cfg.get("laptop_popup", False):
             return None
-        spec = {"id": p.id, "kind": p.kind, "title": p.title, "text": p.text, "options": p.options,
+        spec = {"id": p.id, "kind": p.kind, "title": p.title, "text": to_plain(p.text), "options": p.options,
                 "escalate_seconds": int(float(self.cfg.get("escalate_after_seconds", 60))) if self.transport.configured else 0,
                 "warning": self.transport.last_error and "Phone delivery problem: " + self.transport.last_error}
         try:
@@ -1502,30 +1577,43 @@ class Bridge:
     def _buttons(p: Pending) -> Buttons | None:
         i = p.id
         if p.kind == "approval":
-            deny = [("❌ Deny", f"#{i} 3"), ("🛑 Deny & stop agent", f"#{i} stop")]
+            deny = [("Skip", f"#{i} 3"), ("Skip & stop agent", f"#{i} stop")]
             if p.meta.get("no_allow"):
                 return [deny]
-            allow = [("✅ Allow once", f"#{i} 1")]
+            allow = [("Allow", f"#{i} 1")]
             if not p.meta.get("no_session"):
-                allow.append(("🔁 Allow this for session", f"#{i} 2"))
+                allow.append(("Allow in this session", f"#{i} 2"))
             return [allow, deny]
         if p.kind == "question":
-            return [[(f"{n}. {o}"[:60], f"#{i} {n}")] for n, o in enumerate(p.options[:10], 1)] or None
-        return [[("👍 End turn", f"#{i} ok")]]
+            return [[(o[:60], f"#{i} {n}")] for n, o in enumerate(p.options[:10], 1)] or None
+        return [[("End turn", f"#{i} ok")]]
 
     def approval_footer(self, no_allow: bool, no_session: bool) -> str:
         if no_allow:
-            return ("⚠️ Part of this isn't shown here, so it can't be allowed from the phone. "
-                    "Check it in VS Code to allow it, or deny it here.")
-        scope = "" if no_session else " \"Allow this for session\" only covers this exact command, file, site or tool."
+            return "⚠️ Part of this isn't shown here, so it can only be skipped from the phone. Check it in VS Code to allow it."
         if self.transport.supports_buttons:
-            return "Tap a button, or type a message to deny with that feedback." + scope
-        return ("Reply *1* allow once" + ("" if no_session else " · *2* allow this for session")
-                + " · *3* deny · *stop* deny & stop agent\n(or type a message to deny with that feedback)." + scope)
+            return ""  # the buttons say it all; typing a reply denies with feedback (see /help)
+        return ("Reply *1* allow" + ("" if no_session else " · *2* allow in this session")
+                + " · *3* skip · *stop* skip & stop agent, or type feedback to skip.")
+
+    def question_footer(self, options: list[str]) -> str:
+        if self.transport.supports_buttons:
+            return "" if options else "Type your answer below."
+        return "Reply with a number or your answer." if options else "Reply with your answer."
+
+    def followup_footer(self) -> str:
+        return "Reply here to keep going." if self.transport.supports_buttons else "Reply to keep going, or *ok* to end."
+
+    def _numbered(self, body: str, options: list[str]) -> str:
+        """Without buttons (WhatsApp), options are listed in the text instead."""
+        if not options or self.transport.supports_buttons:
+            return body
+        return (body + "\n\n" if body else "") + "\n".join(f"*{i}.* {_inline(o, 80)}" for i, o in enumerate(options, 1))
 
     def ask(self, kind: str, session_id: str, title: str, text: str, footer: str,
             wait_minutes: float, options: list[str] | None = None, meta: dict | None = None,
-            still_pending: Callable[[], bool] | None = None, release_on_return: bool = True) -> Pending:
+            still_pending: Callable[[], bool] | None = None, release_on_return: bool = True,
+            heading: str = "") -> Pending:
         p = Pending(next(self.ids), kind, session_id, title, text, options or [], meta=meta or {})
         with self.plock:
             self.pending[p.id] = p
@@ -1533,9 +1621,11 @@ class Bridge:
         buttons = self._buttons(p) if self.transport.supports_buttons else None
 
         def deliver(escalated: bool) -> None:
-            note = "⏰ Not answered on the laptop.\n" if escalated else ""
+            head = f"*{heading}*\n" if heading else ""
+            body = f"{head}{SUB_OPEN}{title} · #{p.id}{SUB_CLOSE}" + (f"\n\n{text.strip()}" if text.strip() else "") \
+                + (f"\n\n{footer}" if footer else "")
             n, sealed = self._seal(buttons) if buttons else ("", None)
-            ref = self.transport.send(f"{note}*[#{p.id}]* {title}\n\n{text}\n\n{footer}", sealed)
+            ref = self.transport.send(body, sealed)
             if n:
                 self._register_buttons(n, ref)
             with p.lock:
@@ -1573,11 +1663,11 @@ class Bridge:
             if still_pending and time.time() - last_check >= 2:
                 last_check = time.time()
                 if not still_pending():
-                    p.resolve({"answered_in_vscode": True}, "laptop", "💻 Answered in VS Code")
+                    p.resolve({"answered_in_vscode": True}, "laptop", "Answered in VS Code")
                     break
             if release_on_return and not popup_mode and self.idle() < 3:
                 back = {"approval": {"decision": "vscode"}, "question": {"vscode": True}}.get(kind, {"end": True})
-                if p.resolve(back, "laptop", "💻 You're back: moved to VS Code"):
+                if p.resolve(back, "laptop", "Moved to VS Code"):
                     log.info("#%s released to VS Code (laptop activity)", p.id)
         if p.resolve({"timeout": True}, "timeout", outcome_label(kind, {"timeout": True}, "timeout")) \
                 and not self.transport.supports_buttons and p.meta.get("phone_sent"):
@@ -1750,11 +1840,11 @@ class Bridge:
         if self._at_laptop():
             return {}  # you're using the laptop: VS Code shows its normal prompt (scanner covers walk-aways)
         detail, cut = describe_permission(p, self._phone_limit())
-        detail = context_block(*request_context(sid)) + detail
+        detail += context_block(*request_context(sid))
         title = session_title(sid, cwd)
         req = self.ask("approval", sid, title, detail, self.approval_footer(cut, not grant_ok),
                        self.cfg["approval_wait_minutes"], ["Allow once", "Allow for session", "Deny"],
-                       meta={"no_allow": cut, "no_session": not grant_ok})
+                       meta={"no_allow": cut, "no_session": not grant_ok}, heading=permission_heading(p))
         r = req.result or {}
         if r.get("timeout") or r.get("decision") == "vscode":
             return {}
@@ -1783,7 +1873,6 @@ class Bridge:
                 args = json.loads(args)
             except ValueError:
                 args = {"question": args}
-        text, options = format_question(args)
         cwd = payload.get("cwd", "")
         if (self.cfg.get("questions_via_chat") and float(self.cfg.get("turn_hold_minutes", 0)) > 0
                 and not self.cfg.get("hold_in_hook") and not self.cfg.get("laptop_popup") and not self.paused):
@@ -1798,13 +1887,10 @@ class Bridge:
             }
         if self._at_laptop():
             return {}  # you're using the laptop: VS Code shows its normal question form
-        footer = "❓ " + ("Tap an option or type your answer." if options and self.transport.supports_buttons
-                        else "Reply with your answer" + (" (option number or text)." if options else "."))
-        if options:
-            text += "\n\n" + "\n".join(f"*{i}.* {o}" for i, o in enumerate(options, 1))
-        text = context_block(request_context(sid)[0], "") + text
-        req = self.ask("question", sid, session_title(sid, cwd), text, footer,
-                       self.cfg["question_wait_minutes"], options)
+        heading, text, options = question_card(args)
+        text = (self._numbered(text, options) + context_block(request_context(sid)[0], "")).strip("\n")
+        req = self.ask("question", sid, session_title(sid, cwd), text, self.question_footer(options),
+                       self.cfg["question_wait_minutes"], options, heading=heading)
         r = req.result or {}
         if r.get("timeout") or r.get("vscode"):
             return {}
@@ -1836,10 +1922,8 @@ class Bridge:
         if not can_continue or self.cfg.get("followup_wait_minutes", 0) <= 0:
             self.send(f"✅ {title} finished.\n\n{last}")
             return {}
-        req = self.ask("followup", sid, title, f"✅ Agent finished its turn.\n\n{last}",
-                       "💬 Type a follow-up prompt to continue, or " +
-                       ("tap *End turn*." if self.transport.supports_buttons else "reply *ok* to end."),
-                       self.cfg["followup_wait_minutes"])
+        req = self.ask("followup", sid, title, last, self.followup_footer(),
+                       self.cfg["followup_wait_minutes"], heading="Agent finished")
         r = req.result or {}
         if r.get("prompt"):
             self.consecutive_blocks[sid] = self.consecutive_blocks.get(sid, 0) + 1
@@ -1881,19 +1965,15 @@ class Bridge:
         if len(last) > 900:
             last = last[:900] + "…"
         if q:
-            text, options = format_question(q)
-            body = f"❓ {text}" + ("\n\n" + "\n".join(f"*{i}.* {o}" for i, o in enumerate(options, 1)) if options else "")
-            footer = ("Tap an option or type your answer." if options and self.transport.supports_buttons
-                      else "Reply with your answer.")
+            heading, body, options = question_card(q)
+            body = self._numbered(body, options)
+            footer = self.question_footer(options)
             kind = "question"
         else:
-            options = []
-            body = f"✅ Agent finished its turn.\n\n{last}"
-            footer = "💬 Type a follow-up prompt to continue, or " + (
-                "tap *End turn*." if self.transport.supports_buttons else "reply *ok* to end.")
+            options, heading, body, footer = [], "Agent finished", last, self.followup_footer()
             kind = "followup"
         req = self.ask(kind, sid, title, body, footer, max(0.1, (hold_end - time.time()) / 60), options,
-                       still_pending=lambda: not replied_in_vscode(), release_on_return=False)
+                       heading=heading, still_pending=lambda: not replied_in_vscode(), release_on_return=False)
         r = req.result or {}
         reply = r.get("prompt") or r.get("text")
         log.info("#%s (held turn in %s) resolved: %s by %s", req.id, sid[:8], r, req.answered_by)

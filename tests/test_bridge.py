@@ -49,7 +49,7 @@ class FakeWhatsApp(B.Transport):
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self._old = B.SESSION_STATE
         B.SESSION_STATE = Path(self.tmp.name)
         self._old_db = B.AGENT_HOST_DB
@@ -227,7 +227,7 @@ class EscalationTests(Base):
         time.sleep(0.1)
         self.assertEqual(self.br.transport.outbox, [])  # laptop only so far
         time.sleep(0.4)
-        self.assertIn("Not answered on the laptop", self.br.transport.outbox[0])
+        self.assertNotIn("Not answered on the laptop", self.br.transport.outbox[0])
         self.br.handle_inbound("1")
         t.join(3)
         self.assertEqual(box["r"], {"behavior": "allow"})
@@ -336,7 +336,7 @@ class NativePromptTests(Base):
         wait_pending(self.br)
         time.sleep(0.1)
         self.assertIn("git push --force", self.br.transport.outbox[0])
-        self.assertIn("waiting in VS Code", self.br.transport.outbox[0])
+        self.assertTrue(self.br.transport.outbox[0].startswith("*Run powershell command?*"))
         ext = self.fake_extension("s1")
         self.br.handle_inbound("1")
         ext.join(5)
@@ -906,7 +906,7 @@ class ContextAndHelperTests(Base):
         self.assertEqual(say, "Running the suite to see what fails.")
         self.assertEqual(B.request_context("s1", "nope"), (task, say))  # unknown id: latest turn
 
-    def test_phone_approval_shows_context_above_the_command(self):
+    def test_phone_approval_shows_context_below_the_command(self):
         self.write_turn("s1", [
             {"type": "user.message", "data": {"content": "Install deps and run tests"}},
             {"type": "assistant.message", "data": {"content": "Installing packages first."}},
@@ -917,10 +917,40 @@ class ContextAndHelperTests(Base):
         while not self.br.transport.outbox and time.time() < end:
             time.sleep(0.01)
         msg = self.br.transport.outbox[0]
-        self.assertLess(msg.index("🧑 You asked: Install deps and run tests"), msg.index("npm install"))
-        self.assertIn("💬 Agent: Installing packages first.", msg)
+        self.assertTrue(msg.startswith("*Run powershell command?*\n"))      # VS Code-style title
+        self.assertLess(msg.index("npm install"), msg.index("> You asked: Install deps and run tests"))
+        self.assertIn("> Agent: Installing packages first.", msg)
         self.br.handle_inbound("3")
         t.join(3)
+
+    def test_question_card_lists_options_once(self):
+        args = {"message": "Context check: is this clear?", "requestedSchema": {"properties": {
+            "verdict": {"type": "string", "title": "Is the context clear?", "enum": ["Yes", "Partly", "No"]}}}}
+        self.assertEqual(B.question_card(args), ("Is the context clear?", "Context check: is this clear?",
+                                                 ["Yes", "Partly", "No"]))
+        tg = FakeTelegram()
+        self.br.transport = tg
+        t, box = run_async(self.br.on_pre_tool, {"sessionId": "s1", "cwd": self.cwd, "toolName": "ask_user",
+                                                 "toolArgs": args})
+        wait_pending(self.br)
+        end = time.time() + 2
+        while not tg.sent("sendMessage") and time.time() < end:
+            time.sleep(0.01)
+        msg = tg.sent("sendMessage")[0]
+        self.assertTrue(msg["text"].startswith("<b>Is the context clear?</b>\n<i>proj"))
+        self.assertEqual(msg["text"].count("Partly"), 0)                 # options only as buttons
+        self.assertEqual(len(msg["reply_markup"]["inline_keyboard"]), 3)
+        self.br.handle_inbound("1")
+        t.join(3)
+
+    def test_context_is_a_collapsed_section_on_telegram(self):
+        html_text = B.to_telegram_html("*T*\n" + B.SUB_OPEN + "x · #1" + B.SUB_CLOSE + B.context_block("do it", ""))
+        self.assertIn("<i>x · #1</i>", html_text)
+        self.assertIn("<blockquote expandable>You asked: do it</blockquote>", html_text)
+        # layout markers in agent text are stripped, so they can't hide parts of a command
+        hidden = "rm -rf /" + B.MORE_OPEN + "secret" + B.MORE_CLOSE
+        self.assertNotIn(B.MORE_OPEN, B.describe_permission(
+            {"kind": "shell", "tool": "powershell", "args": {"command": hidden}, "server": ""})[0])
 
     def test_helper_window_is_recognised_and_closed_when_idle(self):
         self.br._companion_launched = time.time()
@@ -1013,14 +1043,14 @@ class TelegramTests(Base):
         tg, t, box, pid, msg, mid = self.approval_on_telegram()
         self.assertIn("<pre>npm install</pre>", msg["text"])
         kb = msg["reply_markup"]["inline_keyboard"]
-        self.assertEqual(kb[0][1]["text"], "🔁 Allow this for session")
+        self.assertEqual(kb[0][1]["text"], "Allow in this session")
         self.assertTrue(kb[0][1]["callback_data"].endswith(f"|#{pid} 2"))
         self.br.handle_callback(kb[0][1]["callback_data"], mid)
         t.join(3)
         self.assertEqual(box["r"], {"behavior": "allow"})
         time.sleep(0.1)
         edit = tg.sent("editMessageReplyMarkup")[-1]
-        self.assertEqual(edit["reply_markup"]["inline_keyboard"][0][0]["text"], "🔁 Allowed for session")
+        self.assertEqual(edit["reply_markup"]["inline_keyboard"][0][0]["text"], "✓ Allowed in this session")
         self.assertEqual(len(tg.sent("sendMessage")), 1)  # no extra "received" message
 
     def test_question_buttons_and_slash_commands(self):
@@ -1064,7 +1094,7 @@ class EndToEndTests(unittest.TestCase):
     """Real HTTP server + hook.py subprocess, WhatsApp reply simulated."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.port = free_port()
         self.cfg_path = Path(self.tmp.name) / "config.json"
         c = cfg(port=self.port, approval_wait_minutes=1)
