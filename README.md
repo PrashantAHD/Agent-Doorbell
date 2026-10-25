@@ -9,18 +9,31 @@ Approve commands, answer questions, and send prompts from Telegram, without goin
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![VS Code](https://img.shields.io/badge/VS%20Code-Copilot%20agents-007ACC?logo=visualstudiocode&logoColor=white)
 ![Telegram](https://img.shields.io/badge/Telegram-bot-26A5E4?logo=telegram&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-66%20passing-2EA44F)
+![Tests](https://img.shields.io/badge/tests-71%20passing-2EA44F)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 
-[Features](#features) · [How it works](#how-it-works) · [Quick start](#quick-start) · [Using it](#using-it-from-your-phone) · [Security](#security) · [Reliability](#reliability) · [Limitations](#limitations) · [FAQ](#faq)
+[Why](#the-problem-it-solves) · [Features](#features) · [How it works](#how-it-works) · [Quick start](#quick-start) · [Using it](#using-it-from-your-phone) · [Security](#security) · [Reliability](#reliability) · [Limitations](#limitations) · [FAQ](#faq)
 
 </div>
 
 ---
 
-Coding agents stop and wait for a human all the time: *"Run `npm test`?"*, *"Which database should I use?"*, *"Done. What next?"*. If you're away from the laptop, the agent just sits there.
+## The problem it solves
 
-**Agent Doorbell** watches every Copilot session in VS Code. Anything left unanswered for a minute is also sent to your phone, with buttons. Tap once, and VS Code carries on.
+AI coding agents (like GitHub Copilot's agent mode in VS Code) work on their own, but they regularly stop for a **human in the loop**:
+
+| The agent stops to… | Example |
+|---|---|
+| 🔐 ask permission | *"Run `npm install`?"* · *"Edit `.vscode/settings.json`?"* · *"Fetch this URL?"* |
+| ❓ ask a question | *"Postgres or MySQL?"* |
+| ✅ report it's done | *"Tests pass. What next?"* |
+
+These prompts only appear in VS Code. **If you're away from the laptop, the agent just waits**: a five-minute task can sit unfinished for hours because nobody clicked *Allow*. Until now, your options were:
+
+- 🪑 **Stay at your desk** and babysit the agent, or
+- ⚠️ **Turn on "approve everything"**, which lets the agent run any command unattended. That's risky.
+
+**Agent Doorbell is the third option.** The agent keeps asking you, but the question comes to your phone too. Each message says what you asked for, what the agent is doing, and exactly what it wants to run. You decide from wherever you are, and VS Code carries on.
 
 <table>
 <tr>
@@ -29,6 +42,9 @@ Coding agents stop and wait for a human all the time: *"Run `npm test`?"*, *"Whi
 **What arrives on your phone**
 
 > **[#12]** 📁 billing-api · Fix flaky tests
+>
+> 🧑 You asked: Make the test suite stable in CI
+> 💬 Agent: Running the tests serially to find the flaky one.
 >
 > 🖥️ Run powershell command — Run the test suite:
 > ```
@@ -58,6 +74,7 @@ Coding agents stop and wait for a human all the time: *"Run `npm test`?"*, *"Whi
 | | Feature | Details |
 |---|---|---|
 | 🔐 | **Approvals** | Shell commands, sensitive file edits, web fetches, and MCP tools, with the full command or diff |
+| 🧭 | **Context included** | Every message shows the session, what you asked for, and what the agent said just before asking |
 | ❓ | **Questions** | The agent's question, with a button for each option, or type a free-text answer |
 | ✅ | **Turn finished** | The agent's last reply. Type a follow-up and it keeps working |
 | 🗂️ | **Prompt any session** | `/sessions` lists your VS Code sessions. Pick one and send it prompts from the phone |
@@ -155,6 +172,7 @@ Re-run `install.ps1` after changing settings.
 | `push_after_seconds` | `60` | How long a prompt, question, or finished turn waits in VS Code before your phone rings |
 | `max_wait_hours` | `168` | How long a phone request stays open. It closes as soon as you answer anywhere |
 | `keep_awake` | `true` | Stops Windows from sleeping because of inactivity while the bridge runs. The screen still turns off and locks |
+| `helper_idle_minutes` | `10` | Closes the helper VS Code window the bridge opened after this long without work. It reopens when needed |
 | `notify_turn_end` | `true` | Send "turn finished" cards |
 | `provider` | `auto` | `telegram`, `twilio` (WhatsApp), or `auto` (Telegram if paired) |
 | `passthrough_tools` | list | Tools that never ring the phone |
@@ -265,7 +283,7 @@ If your company blocks scheduled tasks, `install.ps1` falls back to a Startup sh
 
 - **Windows only:** inactivity handling, the installer, and autostart are Windows-specific.
 - **Copilot sessions only:** sessions using the Claude or Codex agents in VS Code have their own hook systems and aren't covered.
-- **Answering prompts already showing in VS Code** goes through the helper extension in a separate, minimized VS Code window, because the Agents window doesn't load extra extensions. Keep it open; the bridge reopens it when needed (the first answer then takes about 15 s longer).
+- **Answering prompts already showing in VS Code** goes through the helper extension, because the Agents window doesn't load extra extensions. When needed, the bridge opens a minimized helper VS Code window (the first answer takes about 15 s longer). It closes itself after 10 idle minutes, or 2 minutes after the bridge stops. Windows you opened yourself, or windows with files open, are never closed.
 - **Questions answered from the phone:** VS Code's question form is cancelled and your answer arrives as your next message. The form shows as cancelled; the agent gets your answer.
 - **`/sessions` prompts** are best-effort, especially for sessions that have been idle a long time. You get a ⚠️ message if one doesn't arrive.
 - **Two sessions in the same folder waiting at once:** the bridge won't guess which one you mean, so answer on the laptop.
@@ -275,11 +293,20 @@ If your company blocks scheduled tasks, `install.ps1` falls back to a Startup sh
 ## FAQ
 
 <details>
+<summary><b>Can I trust the "💬 Agent" line in a message?</b></summary>
+
+<br>
+
+Treat it as the agent's explanation, not as proof. An agent misled by a malicious file or web page could describe a command as harmless. The command, diff, or arguments shown below it are what actually runs. Always read those before tapping **Allow**.
+
+</details>
+
+<details>
 <summary><b>Does my code or chat go through a third-party server?</b></summary>
 
 <br>
 
-Only the messages sent to your phone go through Telegram: the command, diff, question, or the agent's last reply. Everything else stays on your laptop. Don't use it for sessions whose content mustn't leave your machine.
+Only the messages sent to your phone go through Telegram: the command, diff, question, the agent's last reply, and a short summary of your prompt. Everything else stays on your laptop. Don't use it for sessions whose content mustn't leave your machine.
 
 </details>
 

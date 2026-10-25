@@ -52,6 +52,8 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self._old = B.SESSION_STATE
         B.SESSION_STATE = Path(self.tmp.name)
+        self._old_db = B.AGENT_HOST_DB
+        B.AGENT_HOST_DB = Path(self.tmp.name) / "no-agent-host.db"  # never read the real VS Code catalog
         B._prompt_cache.clear()
         self.cwd = str(Path(self.tmp.name) / "proj")
         self.br = B.Bridge(cfg(), transport=FakeWhatsApp(), popup_launcher=lambda p: None)
@@ -59,6 +61,7 @@ class Base(unittest.TestCase):
 
     def tearDown(self):
         B.SESSION_STATE = self._old
+        B.AGENT_HOST_DB = self._old_db
         self.tmp.cleanup()
 
     def perm(self, **kw):
@@ -295,7 +298,7 @@ class NativePromptTests(Base):
         super().setUp()
         self.br.native_grace = 0
         self.br.press_timeout = 1.0
-        self.br.ext_seen = time.time()
+        self.br.ext_instances[""] = {"first": time.time(), "seen": time.time(), "empty": True}
         self.br.vs_lookup = lambda cwd: [{"id": "AHP1", "modified": 1, "chats": ["ahp-chat://default/x"]}]
         self.make_session("s1")
 
@@ -372,7 +375,7 @@ class NativePromptTests(Base):
         self.assertEqual(len(self.br.pending), 1)
 
     def test_reports_when_extension_missing(self):
-        self.br.ext_seen = 0
+        self.br.ext_instances.clear()
         self.br.ensure_companion = lambda wait=45.0: False
         self.br.scan_once()
         wait_pending(self.br)
@@ -504,7 +507,7 @@ class StayOpenTests(Base):
         self.br.native_grace = 0
         self.br.scan_interval = 0.05
         self.br.press_timeout = 1.0
-        self.br.ext_seen = time.time()
+        self.br.ext_instances[""] = {"first": time.time(), "seen": time.time(), "empty": True}
         self.br.vs_lookup = lambda cwd: [{"id": "AHP1", "modified": 1, "chats": []}]
         d = B.SESSION_STATE / "s1"
         d.mkdir(parents=True, exist_ok=True)
@@ -645,7 +648,7 @@ class PromptFromPhoneTests(Base):
     def setUp(self):
         super().setUp()
         self.br.cfg["hold_in_hook"] = False
-        self.br.ext_seen = time.time()
+        self.br.ext_instances[""] = {"first": time.time(), "seen": time.time(), "empty": True}
         self.br.press_timeout = 1.0
         self.other = str(Path(self.tmp.name) / "other")
         self.br.vs_list = lambda: [
@@ -880,6 +883,76 @@ class SupervisorTests(unittest.TestCase):
         self.assertTrue(B.single_instance(name))
         if os.name == "nt":
             self.assertFalse(B.single_instance(name))
+
+
+class ContextAndHelperTests(Base):
+    """Phone messages carry context; the helper window is recognised and closed when idle."""
+
+    def write_turn(self, sid, events):
+        d = B.SESSION_STATE / sid
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "events.jsonl").write_text("\n".join(json.dumps(e) for e in events), encoding="utf-8")
+
+    def test_request_context_uses_the_turn_prompt_and_the_calling_message(self):
+        self.write_turn("s1", [
+            {"type": "user.message", "data": {"content": "old prompt"}},
+            {"type": "user.message", "data": {"content": "Fix the **flaky** `tests` <reminder>x</reminder>"}},
+            {"type": "assistant.message", "data": {"content": "Running the suite to see what fails.",
+                                                   "toolRequests": [{"toolCallId": "t1"}]}},
+            {"type": "assistant.message", "data": {"content": "", "toolRequests": [{"toolCallId": "t2"}]}},
+        ])
+        task, say = B.request_context("s1", "t2")
+        self.assertEqual(task, "Fix the flaky 'tests' x")      # markup and backticks neutralised
+        self.assertEqual(say, "Running the suite to see what fails.")
+        self.assertEqual(B.request_context("s1", "nope"), (task, say))  # unknown id: latest turn
+
+    def test_phone_approval_shows_context_above_the_command(self):
+        self.write_turn("s1", [
+            {"type": "user.message", "data": {"content": "Install deps and run tests"}},
+            {"type": "assistant.message", "data": {"content": "Installing packages first."}},
+        ])
+        t, box = run_async(self.br.on_permission, self.perm())
+        wait_pending(self.br)
+        end = time.time() + 2
+        while not self.br.transport.outbox and time.time() < end:
+            time.sleep(0.01)
+        msg = self.br.transport.outbox[0]
+        self.assertLess(msg.index("🧑 You asked: Install deps and run tests"), msg.index("npm install"))
+        self.assertIn("💬 Agent: Installing packages first.", msg)
+        self.br.handle_inbound("3")
+        t.join(3)
+
+    def test_helper_window_is_recognised_and_closed_when_idle(self):
+        self.br._companion_launched = time.time()
+        self.br.cfg["helper_idle_minutes"] = 0.0005
+        r = self.br.wait_jobs(-1, 0.1, instance="helperA", empty=True)
+        self.assertTrue(r["helper"])
+        r = self.br.wait_jobs(-1, 0.1, instance="userWin", empty=True)  # a second window isn't the helper
+        self.assertFalse(r["helper"])
+        time.sleep(0.1)
+        self.assertTrue(self.br.wait_jobs(0, 0.1, instance="helperA", empty=True).get("close"))
+        self.assertFalse(self.br.wait_jobs(0, 0.1, instance="userWin", empty=True).get("close"))
+
+    def test_helper_not_closed_while_a_request_is_open(self):
+        self.br._companion_launched = time.time()
+        self.br.cfg["helper_idle_minutes"] = 0.0005
+        self.br.wait_jobs(-1, 0.1, instance="helperA", empty=True)
+        t, box = run_async(self.br.on_permission, self.perm())
+        wait_pending(self.br)
+        time.sleep(0.1)
+        self.assertFalse(self.br.wait_jobs(0, 0.1, instance="helperA", empty=True).get("close"))
+        self.br.handle_inbound("3")
+        t.join(3)
+
+    def test_each_job_goes_to_one_window_and_the_helper_first(self):
+        self.br._companion_launched = time.time()
+        self.br.wait_jobs(-1, 0.1, instance="helperA", empty=True)
+        self.br.wait_jobs(-1, 0.1, instance="userWin", empty=False)
+        jid = self.br.post_job({"command": "workbench.action.chat.acceptTool", "resources": []})
+        self.assertEqual(self.br.wait_jobs(0, 0.2, instance="userWin")["jobs"], [])  # helper gets first go
+        got = self.br.wait_jobs(0, 0.2, instance="helperA", empty=True)["jobs"]
+        self.assertEqual([j["id"] for j in got], [jid])
+        self.assertEqual(self.br.wait_jobs(0, 0.2, instance="userWin")["jobs"], [])  # never run twice
 
 
 class TelegramTests(Base):

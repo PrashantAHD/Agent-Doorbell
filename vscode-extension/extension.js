@@ -10,9 +10,27 @@ const ALLOWED = new Set([
   'workbench.action.chat.skipTool',
   'workbench.action.chat.submit',
 ]);
+const INSTANCE = require('crypto').randomBytes(8).toString('hex'); // one per VS Code window
+const BRIDGE_GONE_MS = 2 * 60 * 1000; // helper window closes itself if the bridge is gone this long
 let stopped = false;
+let isHelper = false; // set by the bridge when it opened this window itself
+let lastOk = Date.now();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// A window the user works in (folder or files open) is never closed automatically.
+function isEmptyWindow() {
+  const folders = vscode.workspace.workspaceFolders;
+  if (folders && folders.length) return false;
+  return !vscode.workspace.textDocuments.some(
+    (d) => d.uri.scheme === 'file' || (d.uri.scheme === 'untitled' && d.isDirty));
+}
+
+async function closeThisWindow(reason) {
+  stopped = true;
+  console.log(`[agent-doorbell] closing helper window: ${reason}`);
+  await vscode.commands.executeCommand('workbench.action.closeWindow');
+}
 
 function call(method, path, body, timeoutMs) {
   return new Promise((resolve, reject) => {
@@ -23,7 +41,7 @@ function call(method, path, body, timeoutMs) {
       return reject(e);
     }
     const data = body ? JSON.stringify(body) : undefined;
-    const headers = { 'Content-Type': 'application/json', 'X-Bridge-Token': cfg.token || '', 'X-Ext-Version': '8' };
+    const headers = { 'Content-Type': 'application/json', 'X-Bridge-Token': cfg.token || '', 'X-Ext-Version': '9' };
     if (data) headers['Content-Length'] = Buffer.byteLength(data);
     const req = http.request(
       {
@@ -97,12 +115,21 @@ async function loop() {
   let after = -1;
   while (!stopped) {
     try {
-      const res = await call('GET', `/vscode/jobs?after=${after}`, undefined, 40000);
+      const empty = isEmptyWindow() ? 1 : 0;
+      const res = await call('GET', `/vscode/jobs?after=${after}&instance=${INSTANCE}&empty=${empty}`, undefined, 40000);
+      lastOk = Date.now();
+      if (res.helper) isHelper = true;
       if (res.close) {
-        // A newer copy of this extension is running elsewhere: close this stale helper window.
-        stopped = true;
-        await vscode.commands.executeCommand('workbench.action.closeWindow');
-        return;
+        if (!res.helper) {
+          // A newer copy of this extension is running elsewhere: close this stale helper window.
+          await closeThisWindow('outdated copy');
+          return;
+        }
+        if (isEmptyWindow()) {
+          await closeThisWindow('idle');
+          return;
+        }
+        isHelper = false; // you started working in it, so it's yours now
       }
       if (after < 0) {
         after = typeof res.last === 'number' ? res.last : 0; // ignore jobs from before we connected
@@ -115,7 +142,12 @@ async function loop() {
         call('POST', '/vscode/result', { id: job.id, errors, info }, 5000).catch(() => {});
       }
     } catch {
-      await sleep(5000); // bridge not running; keep trying quietly
+      // Bridge not running. The helper window closes itself after a while; other windows just wait.
+      if (isHelper && Date.now() - lastOk > BRIDGE_GONE_MS && isEmptyWindow()) {
+        await closeThisWindow('bridge stopped');
+        return;
+      }
+      await sleep(5000);
     }
   }
 }

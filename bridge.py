@@ -47,7 +47,7 @@ LOG_PATH = HERE / "bridge.log"
 COPILOT_HOME = Path(os.environ.get("COPILOT_HOME", Path.home() / ".copilot"))
 SESSION_STATE = COPILOT_HOME / "session-state"
 WA_MAX = 1550  # Twilio WhatsApp body limit is 1600 chars
-EXT_VERSION = "8"  # must match X-Ext-Version sent by vscode-extension/extension.js
+EXT_VERSION = "9"  # must match X-Ext-Version sent by vscode-extension/extension.js
 
 DEFAULT_CONFIG: dict[str, Any] = {
     # "auto" uses Telegram when paired, otherwise Twilio WhatsApp when configured.
@@ -77,6 +77,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Stop Windows from sleeping because of inactivity while the bridge runs (the screen can still
     # turn off and lock). Closing the lid or choosing Sleep still sleeps the laptop.
     "keep_awake": True,
+    # Close the helper VS Code window the bridge opened after this many minutes without work
+    # (it's reopened automatically when a phone answer needs it).
+    "helper_idle_minutes": 10,
     # Hold a finished turn open (via the agentStop hook) for up to this many minutes so a phone
     # reply can continue it reliably. 0 = don't hold; phone replies are delivered best-effort.
     "turn_hold_minutes": 0,
@@ -413,10 +416,17 @@ def _events(session_id: str, transcript: str | None = None) -> list[dict]:
 
 
 def session_title(session_id: str, cwd: str) -> str:
+    """'📁 folder · title' using the session title VS Code shows (falls back to the first prompt)."""
     folder = Path(cwd).name if cwd else "?"
     name = ""
+    try:
+        titled = [s for s in (vscode_sessions_for_cwd(cwd) if cwd else []) if s["title"] != "(untitled)"]
+        if titled:
+            name = titled[0]["title"]  # the most recently active session in that folder
+    except Exception:
+        pass
     ws = SESSION_STATE / session_id / "workspace.yaml" if session_id else None
-    if ws and ws.exists():
+    if not name and ws and ws.exists():
         for line in ws.read_text(encoding="utf-8", errors="replace").splitlines():
             if line.startswith("name:"):
                 name = line[5:].strip().strip("'\"")
@@ -425,6 +435,61 @@ def session_title(session_id: str, cwd: str) -> str:
     if len(name) > 60:
         name = name[:57] + "…"
     return f"📁 {folder}" + (f" · {name}" if name else "")
+
+
+def _message_events(session_id: str, max_bytes: int) -> list[dict]:
+    """user.message / assistant.message events from the last max_bytes of a session log. Other
+    lines (tool output, screenshots) are skipped without parsing, so large tails stay cheap."""
+    path = SESSION_STATE / session_id / "events.jsonl"
+    out = []
+    for line in _read_tail(path, max_bytes):
+        head = line[:60]
+        if '"user.message"' in head or '"assistant.message"' in head:
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                pass
+    return out
+
+
+def request_context(session_id: str, tool_call_id: str = "") -> tuple[str, str]:
+    """(your prompt for this turn, what the agent said just before this request), shortened for the
+    phone. With tool_call_id, the agent text comes from the message that made that tool call."""
+
+    def scan(events: list[dict], call_id: str) -> tuple[str, str, bool]:
+        say, found = "", not call_id
+        for e in reversed(events):
+            t, d = e.get("type"), e.get("data") or {}
+            if t == "assistant.message":
+                if not found:
+                    if any((r or {}).get("toolCallId") == call_id for r in d.get("toolRequests") or []):
+                        found = True
+                    else:
+                        continue
+                if not say and (d.get("content") or "").strip():
+                    say = d["content"]
+            elif t == "user.message" and found:
+                return d.get("content") or "", say, True
+        return "", say, found
+
+    task = say = ""
+    for size in (512_000, 4_000_000, 32_000_000):  # big tool outputs can push the prompt far back
+        events = _message_events(session_id, size)
+        task, say, found = scan(events, tool_call_id)
+        if tool_call_id and not found:
+            task, say, _ = scan(events, "")
+        if task:
+            break
+
+    def tidy(s: str, n: int) -> str:
+        return _inline(re.sub(r"<[^>]{1,40}>", " ", s).replace("*", ""), n)
+
+    return tidy(task, 200), tidy(say, 350)
+
+
+def context_block(task: str, say: str) -> str:
+    lines = ([f"🧑 You asked: {task}"] if task else []) + ([f"💬 Agent: {say}"] if say else [])
+    return "\n".join(lines) + "\n\n" if lines else ""
 
 
 def _ts(e: dict) -> float:
@@ -910,6 +975,9 @@ class Bridge:
         self.jobs_cond = threading.Condition()
         self.job_ids = itertools.count(int(time.time() * 1000))  # keeps ids increasing across bridge restarts
         self.ext_seen = 0.0
+        self.ext_instances: dict[str, dict] = {}  # helper extension instance -> {"first", "seen", "empty"}
+        self.helper_id: str | None = None  # the window the bridge opened itself (auto-closed when idle)
+        self.last_job_at = 0.0
 
     def _at_laptop(self) -> bool:
         """True when the hook should let VS Code show its own prompt right away."""
@@ -956,7 +1024,9 @@ class Bridge:
             last = last_assistant_message(sid, transcript)
             if len(last) > 900:
                 last = last[:900] + "…"
-            req = self.ask("followup", sid, session_title(sid, cwd), f"✅ Agent finished its turn.\n\n{last}",
+            task = request_context(sid)[0]
+            req = self.ask("followup", sid, session_title(sid, cwd),
+                           context_block(task, "") + f"✅ Agent finished its turn.\n\n{last}",
                            "💬 Type a follow-up prompt to continue, or " +
                            ("tap *End turn*." if self.transport.supports_buttons else "reply *ok* to end."),
                            self._max_wait_minutes(), still_pending=current, release_on_return=False)
@@ -975,22 +1045,69 @@ class Bridge:
         with self.jobs_cond:
             job = {**job, "id": next(self.job_ids), "created": time.time()}
             self.jobs = [j for j in self.jobs if time.time() - j["created"] < 30] + [job]
+            self.last_job_at = time.time()
             self.jobs_cond.notify_all()
             return job["id"]
 
-    def wait_jobs(self, after: int, timeout: float) -> dict:
-        self.ext_seen = time.time()
+    def _helper_alive(self) -> bool:
+        if not self.helper_id:
+            return False
+        inst = self.ext_instances.get(self.helper_id)
+        return bool(inst) and time.time() - inst["seen"] < 40
+
+    def _helper_idle(self) -> bool:
+        idle_for = time.time() - max(self.last_job_at, getattr(self, "_companion_launched", 0.0))
+        with self.plock:
+            busy = bool(self.pending)  # a phone answer may need the window soon
+        return not busy and idle_for > float(self.cfg.get("helper_idle_minutes", 10)) * 60
+
+    def wait_jobs(self, after: int, timeout: float, instance: str = "", empty: bool = False) -> dict:
+        """Long-poll from a helper extension instance (one per VS Code window). Each job goes to one
+        window only, preferably the helper window the bridge opened itself."""
+        now = time.time()
         with self.jobs_cond:
+            self.ext_seen = now
+            inst = self.ext_instances.setdefault(instance, {"first": now})
+            inst.update(seen=now, empty=empty)
+            launched = getattr(self, "_companion_launched", 0.0)
+            if (instance and empty and self.helper_id is None and now - launched < 180
+                    and inst["first"] >= launched - 1 and getattr(self, "_helper_for_launch", None) != launched):
+                self.helper_id = instance  # the window that connected right after we opened one
+                self._helper_for_launch = launched  # only one helper per window we opened
+                log.info("helper window connected (%s)", instance[:8])
+            is_helper = bool(instance) and instance == self.helper_id
             last = self.jobs[-1]["id"] if self.jobs else 0
             if after < 0:
-                return {"jobs": [], "last": last}
-            self.jobs_cond.wait_for(lambda: any(j["id"] > after for j in self.jobs), timeout=timeout)
-            fresh = [j for j in self.jobs if j["id"] > after and time.time() - j["created"] < 30]
-            return {"jobs": fresh, "last": self.jobs[-1]["id"] if self.jobs else 0}
+                return {"jobs": [], "last": last, "helper": is_helper}
+            if is_helper and self._helper_idle():
+                self.helper_id = None
+                self.ext_instances.pop(instance, None)
+                log.info("closing the idle helper window (%s)", instance[:8])
+                return {"jobs": [], "last": last, "helper": True, "close": True}
+
+            def claimable(j: dict) -> bool:
+                age = time.time() - j["created"]
+                if j["id"] <= after or j.get("claimed") or age >= 30:
+                    return False
+                return is_helper or not self._helper_alive() or age >= 3  # let the helper take it first
+
+            end = now + timeout
+            while not any(claimable(j) for j in self.jobs):
+                rem = end - time.time()
+                if rem <= 0:
+                    break
+                self.jobs_cond.wait(min(rem, 1.0))
+            fresh = [j for j in self.jobs if claimable(j)]
+            for j in fresh:
+                j["claimed"] = instance or "?"
+            if instance in self.ext_instances:
+                self.ext_instances[instance]["seen"] = time.time()
+            return {"jobs": fresh, "last": self.jobs[-1]["id"] if self.jobs else 0, "helper": is_helper}
 
     @property
     def extension_connected(self) -> bool:
-        return time.time() - self.ext_seen < 90
+        cutoff = time.time() - 40
+        return any(i["seen"] > cutoff for i in self.ext_instances.values())
 
     def _waiting_runtime_sessions(self, cwd: str) -> list[str]:
         want = os.path.normcase(os.path.abspath(cwd))
@@ -1016,6 +1133,7 @@ class Bridge:
             return True
         if time.time() - getattr(self, "_companion_launched", 0) > 120:
             self._companion_launched = time.time()
+            self.helper_id = None
             log.info("companion extension not connected: opening a minimized VS Code window")
             try:
                 subprocess.Popen(["powershell", "-NoProfile", "-Command",
@@ -1104,6 +1222,8 @@ class Bridge:
     def handle_native_question(self, sid: str, cid: str, args: dict) -> None:
         cwd = session_cwd(sid)
         text, options = format_question(args)
+        task, _ = request_context(sid, cid)
+        text = context_block(task, "") + "❓ " + text
         if options:
             text += "\n\n" + "\n".join(f"*{i}.* {o}" for i, o in enumerate(options, 1))
         footer = "🖥️ This question is waiting in VS Code. " + (
@@ -1126,6 +1246,7 @@ class Bridge:
         gkey = grant_key(p)
         grant_ok = session_grant_ok(p, cwd, self.cfg["sensitive_write_globs"])
         detail, cut = describe_permission(p, self._phone_limit())
+        detail = context_block(*request_context(sid, str(pr.get("toolCallId") or ""))) + detail
         footer = "🖥️ This is waiting in VS Code. " + self.approval_footer(cut, not grant_ok)
         req = self.ask("approval", sid, session_title(sid, cwd), detail, footer,
                        self._max_wait_minutes(), ["Allow once", "Allow for session", "Deny"],
@@ -1629,6 +1750,7 @@ class Bridge:
         if self._at_laptop():
             return {}  # you're using the laptop: VS Code shows its normal prompt (scanner covers walk-aways)
         detail, cut = describe_permission(p, self._phone_limit())
+        detail = context_block(*request_context(sid)) + detail
         title = session_title(sid, cwd)
         req = self.ask("approval", sid, title, detail, self.approval_footer(cut, not grant_ok),
                        self.cfg["approval_wait_minutes"], ["Allow once", "Allow for session", "Deny"],
@@ -1680,6 +1802,7 @@ class Bridge:
                         else "Reply with your answer" + (" (option number or text)." if options else "."))
         if options:
             text += "\n\n" + "\n".join(f"*{i}.* {o}" for i, o in enumerate(options, 1))
+        text = context_block(request_context(sid)[0], "") + text
         req = self.ask("question", sid, session_title(sid, cwd), text, footer,
                        self.cfg["question_wait_minutes"], options)
         r = req.result or {}
@@ -1846,7 +1969,9 @@ def make_handler(bridge: Bridge) -> type[BaseHTTPRequestHandler]:
                     after = int((q.get("after") or ["-1"])[0])
                 except ValueError:
                     after = -1
-                self._json(200, bridge.wait_jobs(after, timeout=25))
+                instance = re.sub(r"[^\w-]", "", (q.get("instance") or [""])[0])[:40]
+                self._json(200, bridge.wait_jobs(after, timeout=25, instance=instance,
+                                                 empty=(q.get("empty") or ["0"])[0] == "1"))
             elif self.path == "/debug/outbox" and self._authorized():
                 self._json(200, bridge.transport.outbox)
             else:
