@@ -42,7 +42,7 @@ These prompts only appear in VS Code. **If you're away from the laptop, the agen
 **What arrives on your phone**
 
 > **Run powershell command?**
-> _billing-api · Fix flaky tests · #12_
+> _billing-api · #12_
 >
 > Run the test suite
 > ```
@@ -72,7 +72,7 @@ These prompts only appear in VS Code. **If you're away from the laptop, the agen
 | | Feature | Details |
 |---|---|---|
 | 🔐 | **Approvals** | Shell commands, sensitive file edits, web fetches, and MCP tools, with the full command or diff. Too long for a message? The complete text comes as a file |
-| 🧭 | **Context included** | Every message shows the session, what you asked for, and what the agent said just before asking |
+| 🧭 | **Context included** | Every message shows the project folder, what you asked for, and what the agent said just before asking |
 | ❓ | **Questions** | The agent's question, with a button for each option, or type a free-text answer |
 | ✅ | **Turn finished** | The agent's last reply, if you haven't replied in VS Code within 5 minutes. Type a follow-up and it keeps working |
 | 🗂️ | **Prompt any session** | `/sessions` lists your VS Code sessions. Pick one and send it prompts from the phone |

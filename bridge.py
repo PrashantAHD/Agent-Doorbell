@@ -575,25 +575,8 @@ def _events(session_id: str, transcript: str | None = None) -> list[dict]:
 
 
 def session_title(session_id: str, cwd: str) -> str:
-    """'folder · title' using the session title VS Code shows (falls back to the first prompt)."""
-    folder = Path(cwd).name if cwd else "?"
-    name = ""
-    try:
-        titled = [s for s in (vscode_sessions_for_cwd(cwd) if cwd else []) if s["title"] != "(untitled)"]
-        if titled:
-            name = titled[0]["title"]  # the most recently active session in that folder
-    except Exception:
-        pass
-    ws = SESSION_STATE / session_id / "workspace.yaml" if session_id else None
-    if not name and ws and ws.exists():
-        for line in ws.read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.startswith("name:"):
-                name = line[5:].strip().strip("'\"")
-                break
-    name = re.sub(r"\s+", " ", name)
-    if len(name) > 60:
-        name = name[:57] + "…"
-    return folder + (f" · {name}" if name else "")
+    """The card subtitle: just the project folder (the session's name isn't shown)."""
+    return Path(cwd).name if cwd else "?"
 
 
 def _message_events(session_id: str, max_bytes: int) -> list[dict]:
