@@ -348,6 +348,9 @@ class Transport:
         """Mark a request message as resolved (e.g. replace its buttons)."""
         self.finals.append((ref, label))
 
+    def edit_buttons(self, ref: Any, buttons: Buttons) -> None:
+        """Redraw a message's buttons (e.g. ticked options)."""
+
     supports_documents = False
 
     def send_document(self, filename: str, data: bytes, caption: str = "") -> Any:
@@ -449,6 +452,16 @@ class TelegramTransport(Transport):
                 "inline_keyboard": [[{"text": label, "callback_data": "noop"}]]}})
         except Exception as e:
             log.debug("finalize failed: %s", e)
+
+    def edit_buttons(self, ref: Any, buttons: Buttons) -> None:
+        if not ref:
+            return
+        try:
+            self.call("editMessageReplyMarkup", {"chat_id": self.chat_id, "message_id": ref, "reply_markup": {
+                "inline_keyboard": [[{"text": label, "callback_data": data[:64]} for label, data in row]
+                                    for row in buttons]}})
+        except Exception as e:
+            log.debug("edit_buttons failed: %s", e)
 
     supports_documents = True
 
@@ -1060,6 +1073,8 @@ def permission_heading(p: dict) -> str:
         return f"{_inline(_first(a, 'intention'), 40).replace('*', '') or 'Edit file'}?"
     if kind == "url":
         return "Fetch web page?"
+    if kind == "read":
+        return f"{_inline(_first(a, 'intention'), 60).replace('*', '') or 'Read file'}?"
     if kind == "mcp":
         return f"Run MCP tool {tool}?"
     return f"Use {tool or 'tool'}?"
@@ -1083,6 +1098,9 @@ def describe_permission(p: dict, limit: int = 2500) -> tuple[str, bool]:
         return out, cut
     if kind == "url":
         return _inline(_first(a, "url", "value"), 500), False
+    if kind == "read":
+        f = _inline(_first(a, "path", "fileName", "file_path", "filePath"), 400)
+        return (f"`{f}`" if f else ""), False
     if kind == "mcp":
         args = a.get("args", {k: v for k, v in a.items() if k not in ('kind', 'toolCallId', 'toolName', 'serverName', 'toolTitle', 'readOnly')})
         shown, cut = _clip(json.dumps(args), limit)
@@ -1090,7 +1108,8 @@ def describe_permission(p: dict, limit: int = 2500) -> tuple[str, bool]:
         return f"`{_inline(tool, 80)}`" + (f" · {server}" if server else "") + f"\n```{shown}```", cut
     args = a.get("args", {k: v for k, v in a.items() if k not in ('kind', 'toolCallId', 'toolName', 'toolDescription')})
     shown, cut = _clip(json.dumps(args), limit)
-    return f"`{_inline(tool, 80)}`\n```{shown}```", cut
+    name = _inline(tool or _first(a, "toolTitle"), 80)
+    return (f"`{name}`\n" if name else "") + f"```{shown}```", cut
 
 
 def permission_full_text(p: dict) -> tuple[str, str]:
@@ -1146,6 +1165,32 @@ def format_question(args: dict) -> tuple[str, list[str]]:
     return _unmark("\n".join(lines).strip()), options
 
 
+def field_choices(f: dict) -> tuple[list[str], list[Any], bool, list[int]]:
+    """(labels, values, pick-several?, pre-selected indexes) of one question-form field. Handles
+    enum/enumNames, oneOf, and array fields (items.enum / items.anyOf / items.oneOf)."""
+    items = f.get("items") if isinstance(f.get("items"), dict) else {}
+    multi = f.get("type") == "array" or bool(items)
+    consts = f.get("oneOf") or items.get("anyOf") or items.get("oneOf") or []
+    vals = f.get("enum") or items.get("enum") or [o.get("const") for o in consts if isinstance(o, dict)]
+    labels = (f.get("enumNames") or items.get("enumNames")
+              or [o.get("title") or o.get("const") for o in consts if isinstance(o, dict)] or vals)
+    labels = [str(x) for x in labels]
+    vals = list(vals) if len(vals) == len(labels) else labels
+    d = f.get("default")
+    defaults = d if isinstance(d, list) else ([d] if d is not None else [])
+    picked = [i for i, v in enumerate(vals) if v in defaults or str(v) in map(str, defaults)]
+    return labels, vals, multi, picked
+
+
+def question_choices(args: dict) -> tuple[bool, list[int]]:
+    """(pick-several?, pre-selected option indexes) for a single-field question form."""
+    props = (args.get("requestedSchema") or {}).get("properties") or {}
+    if len(props) != 1:
+        return False, []
+    _, _, multi, picked = field_choices(next(iter(props.values())))
+    return multi, picked
+
+
 def question_card(args: dict) -> tuple[str, str, list[str]]:
     """(heading, body, options) for an agent question, laid out like VS Code's question card:
     the question as the title, the explanation underneath, options as buttons (listed once)."""
@@ -1156,9 +1201,8 @@ def question_card(args: dict) -> tuple[str, str, list[str]]:
     body: list[str] = []
     if len(props) == 1:
         name, f = next(iter(props.items()))
-        vals = f.get("enum") or [o.get("const") for o in f.get("oneOf", [])] or (f.get("items") or {}).get("enum") or []
-        labels = f.get("enumNames") or [o.get("title") for o in f.get("oneOf", [])] or vals
-        options = [str(x) for x in labels] or options
+        labels, _, _, _ = field_choices(f)
+        options = labels or options
         heading = _md(f.get("title") or "").strip() or q or name
         if q and q != heading:
             body.append(q)
@@ -1167,13 +1211,12 @@ def question_card(args: dict) -> tuple[str, str, list[str]]:
     elif props:
         heading = q or "A few questions"
         for name, f in props.items():
-            vals = f.get("enum") or [o.get("const") for o in f.get("oneOf", [])] or (f.get("items") or {}).get("enum") or []
-            labels = f.get("enumNames") or [o.get("title") for o in f.get("oneOf", [])] or vals
+            labels, _, multi, _ = field_choices(f)
             line = f"• *{_inline(f.get('title') or name, 80).replace('*', '')}*"
             if f.get("description"):
                 line += f" — {_inline(f['description'], 200)}"
             if labels:
-                line += f" ({' / '.join(_inline(str(x), 40) for x in labels)})"
+                line += f" ({(' + ' if multi else ' / ').join(_inline(str(x), 40) for x in labels)})"
             body.append(line)
         options = []
     else:
@@ -1626,8 +1669,10 @@ class Bridge:
         heading, text, options = question_card(args)
         task, _ = request_context(sid, cid)
         text = self._numbered(text, options) + context_block(task, "")
-        req = self.ask("question", sid, session_title(sid, cwd), text.strip("\n"), self.question_footer(options),
-                       self._max_wait_minutes(), options, heading=heading,
+        qmeta = self.question_meta(args)
+        req = self.ask("question", sid, session_title(sid, cwd), text.strip("\n"),
+                       self.question_footer(options, bool(qmeta)),
+                       self._max_wait_minutes(), options, heading=heading, meta=qmeta,
                        still_pending=lambda: cid in pending_prompts(sid)[1], release_on_return=False)
         r = req.result or {}
         log.info("#%s (VS Code question %s in %s) resolved: %s by %s", req.id, cid[:8], sid[:8], r, req.answered_by)
@@ -1908,6 +1953,11 @@ class Bridge:
                 allow.append(("Allow in this session", f"#{i} 2"))
             return [allow, deny]
         if p.kind == "question":
+            if p.meta.get("multi"):  # pick several: tap to tick, then Send
+                picked = p.meta.get("picked") or set()
+                rows = [[(("☑ " if n - 1 in picked else "☐ ") + o[:56], f"#{i} +{n}")]
+                        for n, o in enumerate(p.options[:20], 1)]
+                return rows + [[("Send selected", f"#{i} done")]] if rows else None
             return [[(o[:60], f"#{i} {n}")] for n, o in enumerate(p.options[:10], 1)] or None
         return [[("End turn", f"#{i} ok")]]
 
@@ -1936,7 +1986,26 @@ class Bridge:
                 footer = self.approval_footer(False, not grant_ok, attached=True)
         return detail, footer, meta
 
-    def question_footer(self, options: list[str]) -> str:
+    def _redraw_buttons(self, p: Pending) -> None:
+        """Show the current ticks on a pick-several question (same sealed code, new labels)."""
+        with p.lock:
+            ref, n = p.meta.get("ref"), p.meta.get("seal")
+        buttons = self._buttons(p)
+        if not (ref and n and buttons and self.transport.supports_buttons):
+            return
+        sealed = [[(label, f"{n}|{data}") for label, data in row] for row in buttons]
+        threading.Thread(target=self.transport.edit_buttons, args=(ref, sealed), daemon=True).start()
+
+    @staticmethod
+    def question_meta(args: dict) -> dict:
+        multi, picked = question_choices(args)
+        return {"multi": True, "picked": set(picked)} if multi else {}
+
+    def question_footer(self, options: list[str], multi: bool = False) -> str:
+        if multi and options:
+            if self.transport.supports_buttons:
+                return "Tap to tick options, then *Send selected*. Or type your answer."
+            return "Reply with the numbers you pick, e.g. *1, 3*, or type your answer."
         if self.transport.supports_buttons:
             return "" if options else "Type your answer below."
         return "Reply with a number or your answer." if options else "Reply with your answer."
@@ -1979,6 +2048,7 @@ class Bridge:
                 self._register_buttons(n, ref)
             with p.lock:
                 p.meta["ref"] = ref
+                p.meta["seal"] = n
                 done = p.event.is_set()
             if done and ref:
                 self.transport.finalize(ref, p.meta.get("label") or "Closed")
@@ -2049,6 +2119,30 @@ class Bridge:
         elif p.kind == "question":
             if raw.get("vscode"):
                 result = {"vscode": True}
+            elif p.meta.get("multi"):
+                t = text.strip()
+                if re.fullmatch(r"\+\d+", t):  # a tick box was tapped
+                    k = int(t[1:]) - 1
+                    if 0 <= k < len(p.options):
+                        with p.lock:
+                            picked = p.meta.setdefault("picked", set())
+                            picked.symmetric_difference_update({k})
+                        self._redraw_buttons(p)
+                    return
+                if t.lower() in ("done", "send"):
+                    picks = sorted(p.meta.get("picked") or set())
+                    if not picks:
+                        self.send(f"#{p.id}: tick at least one option first, or type your answer.")
+                        return
+                else:
+                    nums = re.findall(r"\d+", t)
+                    picks = [int(x) - 1 for x in nums] if re.fullmatch(r"[\d\s,;.&and]+", t) and nums else None
+                    if picks is not None and not all(0 <= k < len(p.options) for k in picks):
+                        picks = None
+                if picks is not None:
+                    result = {"text": "; ".join(p.options[k] for k in dict.fromkeys(picks))}
+                else:
+                    result = {"text": t}  # free-text answer
             else:
                 t = text.strip()
                 if t.isdigit() and p.options and 1 <= int(t) <= len(p.options):
@@ -2257,8 +2351,9 @@ class Bridge:
             return {}  # you're using the laptop: VS Code shows its normal question form
         heading, text, options = question_card(args)
         text = (self._numbered(text, options) + context_block(request_context(sid)[0], "")).strip("\n")
-        req = self.ask("question", sid, session_title(sid, cwd), text, self.question_footer(options),
-                       self.cfg["question_wait_minutes"], options, heading=heading)
+        qmeta = self.question_meta(args)
+        req = self.ask("question", sid, session_title(sid, cwd), text, self.question_footer(options, bool(qmeta)),
+                       self.cfg["question_wait_minutes"], options, heading=heading, meta=qmeta)
         r = req.result or {}
         if r.get("timeout") or r.get("vscode"):
             return {}
@@ -2335,13 +2430,15 @@ class Bridge:
         if q:
             heading, body, options = question_card(q)
             body = self._numbered(body, options)
-            footer = self.question_footer(options)
+            qmeta = self.question_meta(q)
+            footer = self.question_footer(options, bool(qmeta))
             kind = "question"
         else:
             options, heading, body, footer = [], "Agent finished", last, self.followup_footer()
-            kind = "followup"
+            kind, qmeta = "followup", {}
         req = self.ask(kind, sid, title, body, footer, max(0.1, (hold_end - time.time()) / 60), options,
-                       heading=heading, still_pending=lambda: not replied_in_vscode(), release_on_return=False)
+                       heading=heading, meta=qmeta, still_pending=lambda: not replied_in_vscode(),
+                       release_on_return=False)
         r = req.result or {}
         reply = r.get("prompt") or r.get("text")
         log.info("#%s (held turn in %s) resolved: %s by %s", req.id, sid[:8], r, req.answered_by)

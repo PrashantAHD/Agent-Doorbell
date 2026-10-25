@@ -1499,6 +1499,63 @@ class AgentHookTests(Base):
         self.assertIn("pre-commit", B.describe_permission(moved)[0])
 
 
+class PickSeveralTests(Base):
+    """Questions where you tick several options (checkbox forms), and read-file prompts."""
+
+    ARGS = {"message": "Which improvements should I implement? (Recommended: 1, 2, 3 now.)", "requestedSchema": {
+        "properties": {"picks": {"type": "array", "title": "Improvements to implement", "default": ["1", "3"],
+                                 "items": {"anyOf": [{"const": "1", "title": "1. Intake"},
+                                                     {"const": "2", "title": "2. Backup"},
+                                                     {"const": "3", "title": "3. Prefix"}]}}}}}
+
+    def start(self):
+        tg = FakeTelegram()
+        self.br.transport = tg
+        t, box = run_async(self.br.on_pre_tool, {"sessionId": "s1", "cwd": self.cwd, "toolName": "ask_user",
+                                                 "toolArgs": self.ARGS})
+        pid = wait_pending(self.br)[0]
+        end = time.time() + 2
+        while not tg.sent("sendMessage") and time.time() < end:
+            time.sleep(0.01)
+        time.sleep(0.05)
+        return tg, t, box, pid, tg.sent("sendMessage")[0], tg.next_id
+
+    def test_options_become_tick_boxes_with_defaults(self):
+        self.assertEqual(B.question_choices(self.ARGS), (True, [0, 2]))
+        tg, t, box, pid, msg, mid = self.start()
+        kb = msg["reply_markup"]["inline_keyboard"]
+        self.assertEqual([r[0]["text"] for r in kb], ["☑ 1. Intake", "☐ 2. Backup", "☑ 3. Prefix", "Send selected"])
+        self.br.handle_callback(kb[1][0]["callback_data"], mid)      # tick 2
+        self.br.handle_callback(kb[0][0]["callback_data"], mid)      # untick 1
+        time.sleep(0.1)
+        redraw = tg.sent("editMessageReplyMarkup")[-1]["reply_markup"]["inline_keyboard"]
+        self.assertEqual([r[0]["text"] for r in redraw][:3], ["☐ 1. Intake", "☑ 2. Backup", "☑ 3. Prefix"])
+        self.assertEqual(redraw[1][0]["callback_data"], kb[1][0]["callback_data"])  # same checked code
+        self.assertEqual(len(self.br.pending), 1)                       # ticking doesn't answer
+        self.br.handle_callback(kb[3][0]["callback_data"], mid)        # Send
+        t.join(3)
+        self.assertIn("2. Backup; 3. Prefix", box["r"]["permissionDecisionReason"])
+
+    def test_typed_numbers_and_free_text(self):
+        tg, t, box, pid, msg, mid = self.start()
+        self.br.handle_inbound("1, 2")
+        t.join(3)
+        self.assertIn("1. Intake; 2. Backup", box["r"]["permissionDecisionReason"])
+        tg, t, box, pid, msg, mid = self.start()
+        self.br.handle_inbound("only the backup please")
+        t.join(3)
+        self.assertIn("only the backup please", box["r"]["permissionDecisionReason"])
+
+    def test_read_prompt_is_described(self):
+        p = B.normalize_permission({"toolName": "", "permissionRequest": {
+            "kind": "read", "intention": "Search in file: C:\\tmp\\codex.txt", "path": "C:\\tmp\\codex.txt"}})
+        self.assertEqual(B.permission_heading(p), "Search in file: C:\\tmp\\codex.txt?")
+        text, _ = B.describe_permission(p)
+        self.assertEqual(text, "`C:\\tmp\\codex.txt`")
+        q = B.describe_permission({"kind": "custom-tool", "tool": "", "args": {"x": 1}, "server": ""})[0]
+        self.assertTrue(q.startswith("```{"))                          # no empty tool name line
+
+
 class InstallHooksTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
