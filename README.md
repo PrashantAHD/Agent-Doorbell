@@ -201,13 +201,33 @@ The bot token can also come from the `TELEGRAM_BOT_TOKEN` environment variable.
 
 ## Security
 
-Agent Doorbell can approve commands on your machine, so it's built to be hard to misuse:
+Agent Doorbell can approve commands on your machine, so it's built to be hard to misuse. In short: **only you, from your own Telegram chat, can answer, and only for the exact request you were shown.** Nothing is ever approved automatically, and if anything goes wrong it falls back to VS Code's normal prompt.
 
-- 🔒 **Local only, and signed.** The bridge listens on `127.0.0.1`. Hooks and the helper extension never send its secret token: every request is signed with it, and they only act on answers the bridge signs back.
-- 👤 **Only you.** Only your paired Telegram chat is accepted. Messages from anyone else are ignored.
-- 🎯 **One Allow, one prompt.** A phone answer is pressed in VS Code only if that exact prompt is still the one waiting.
-- 🧯 **Fails safe.** If the bridge is down, VS Code just shows its normal prompts. Nothing is ever approved by default.
-- 🔐 **TLS done right.** HTTPS is verified against the system certificate store (`truststore`), so it also works behind corporate TLS inspection.
+### How you're protected
+
+| Risk | What stops it |
+|---|---|
+| Someone else messages your bot | Only your paired chat is accepted. Pairing needs a one-time code that only you see, from a private chat. Messages and button taps from any other chat are ignored |
+| Fake, forged, or edited buttons | Each message's buttons carry a random code tied to that one message. A tap only counts if the code, the message, and the action all match what the bridge sent. Button data is never treated as typed text |
+| A dangerous command hidden in a long one | The start **and** end are always shown, with "⚠️ N characters NOT shown" in between. The complete text arrives as a file before Allow is offered; if the file can't be sent, it can only be denied |
+| Fake text injected into the message | Backticks and the bridge's own layout markers are neutralised in the agent's text and commands, so they can't break out of the code block or rearrange the message |
+| "Allow in this session" approving more than you saw | It covers only that exact command, file, website, or MCP tool. It's never offered for sensitive files (`.git`, `.vscode`, dotfiles, `package.json`, …), files outside the workspace, or patches that touch several files or move a file |
+| A phone Allow landing on a different prompt | Right before pressing, VS Code checks that the exact prompt you saw is still waiting, unchanged, and the only one in that session. Otherwise nothing is pressed |
+| Another program on your computer pretending to be the bridge | The secret token is never sent. Every request is signed (HMAC with a timestamp and a one-time nonce, so it can't be replayed), and the hook and VS Code only act on answers the bridge signs back |
+| The bridge being used to run arbitrary VS Code commands | The helper extension only runs three commands: Accept, Skip, and send a chat message |
+| Sandbox escapes approved remotely | Requests to bypass the terminal sandbox are never sent to the phone; they must be confirmed in VS Code |
+| Network snooping | The bridge listens on `127.0.0.1` only. Telegram is reached over HTTPS, verified against your system's certificate store |
+| The bridge crashing or stopping | Fails safe: VS Code just shows its normal prompts. Nothing is approved by default, and answering on the laptop always works |
+
+### What it can't protect against
+
+Be aware of these limits:
+
+- **Your Telegram account and bot token are the keys.** Anyone who can use your Telegram chat (an unlocked phone, a logged-in Telegram Desktop or Web session) can approve requests. Someone with the bot token can't fake buttons, but can change the text of a message the bridge already sent. Use a phone lock, and Telegram's two-step verification.
+- **Telegram sees what's sent to your phone:** the command, diff, question, the agent's last reply, and a short summary of your prompt. Don't use it for work whose content mustn't leave your machine.
+- **The agent's explanation can be wrong or misleading.** An agent misled by a malicious file or web page can describe a command as harmless. Approve based on the command, diff, or file shown, not the "Agent:" line.
+- **Your own account is trusted.** Malware running as you, or an administrator, can read `config.json` (the bot token and signing key) and act as the bridge. Agent Doorbell protects against other users and other programs on the port, not against your own account being compromised.
+- **Logs contain request text.** `bridge.log` holds commands and agent replies. It's excluded from git; keep it private.
 
 ### Vulnerabilities fixed
 
@@ -289,9 +309,11 @@ A security review (Oct 2026) found three ways you could be tricked into approvin
 
 - **Keep the bot token secret.** Never paste it into a chat, email, or file other than `config.json`. If it may have leaked:
   1. Send `/revoke` to **@BotFather** and pick your bot. The old token stops working at once.
-  2. Run `powershell -ExecutionPolicy Bypass -File .\uninstall.ps1`, then `python bridge.py setup-telegram` with the new token.
-  3. Run `powershell -ExecutionPolicy Bypass -File .\install.ps1`.
+  2. Run the uninstaller (`uninstall.ps1` or `./uninstall.sh`), then `python bridge.py setup-telegram` with the new token.
+  3. Run the installer again (`install.ps1` or `./install.sh`).
+- **Lock your phone, and turn on Telegram's two-step verification** (Settings → Privacy and Security → Two-Step Verification). Remove Telegram Desktop/Web sessions you don't use (Settings → Devices).
 - **Read the whole message before tapping Allow**, especially the end of long commands, and the attached file when there is one.
+- **Use `/pause` or `/snooze`** when you don't want to answer from the phone. Everything then stays on the laptop.
 
 > [!NOTE]
 > **Keep `config.json` private.** It holds the bot token and the bridge's signing key. On Windows it's readable only by your account and administrators; the macOS/Linux installer sets it to `600`.
