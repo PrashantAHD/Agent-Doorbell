@@ -1,0 +1,4 @@
+{
+  // New chats in this project start on the low-cost model; AGENTS.md routes reading/coding/reviews to stronger subagents.
+  "chat.defaultModel": "gpt-5.6-luna"
+}

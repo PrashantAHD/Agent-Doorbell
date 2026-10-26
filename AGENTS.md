@@ -24,8 +24,12 @@ macOS/Linux via `install.sh`.
 - Every behaviour change gets a test; security-relevant changes must keep the README Security section accurate.
 
 ## Model routing (keeps costs down)
-The `Doorbell` agent (`.github/agents/`) is the entry point and runs on a low-cost model.
-If you are any other agent, route the same way: code changes beyond a one-line fix go to
-the `Doorbell Developer` subagent; after a change to authentication, signing, buttons,
-approvals/grants, the guard, `hook.py` or `extension.js`, get a review from the
-`Doorbell Security Reviewer` subagent. Do routine work (tests, install, health, logs, git, docs) yourself.
+New chats here start on a low-cost model (`.vscode/settings.json`). Whichever agent
+you are, route every request yourself; the user does not pick agents:
+- Code changes beyond a one-line fix: delegate to the `Doorbell Developer` subagent.
+- After a change to authentication/signing, Telegram buttons, approvals or session
+  grants, the press guard, `hook.py` or `extension.js`: delegate a review to the
+  `Doorbell Security Reviewer` subagent and send its findings back to the Developer.
+- Tests, reinstall, health checks, logs, docs, git: do it yourself.
+Give a subagent everything in one message (goal, files, expected behaviour); it does
+not see the conversation.
