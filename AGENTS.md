@@ -37,4 +37,6 @@ not see the conversation.
 ## Long chats
 `.github/hooks/cost_guard.py` adds a "[Cost guard …]" note to your message once this
 chat passes ~100k tokens of context. Follow it: continue follow-ups here, but move a
-new task to a fresh chat with a short handoff.
+new task to a fresh chat with a short handoff. New chats read `.github/notes.md` first;
+after each task, append 1-3 lines with a decision, current state, half-done work or a
+gotcha. Condense older entries around 60 lines. Never put secrets or client data there.

@@ -1,6 +1,14 @@
 {
   "version": 1,
   "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "powershell": "python .github/hooks/session_start.py",
+        "bash": "python3 .github/hooks/session_start.py",
+        "timeoutSec": 10
+      }
+    ],
     "userPromptTransformed": [
       {
         "type": "command",
