@@ -84,6 +84,22 @@ These prompts only appear in VS Code. **If you're away from the laptop, the agen
 | 🔁 | **Always on** | Restarts itself after a crash, starts at login, and keeps the computer from sleeping on inactivity |
 | 💸 | **Free** | Telegram bots cost nothing. No public URL, ngrok, or webhook needed |
 
+## AI cost-saving strategy
+
+Agent Doorbell uses [Spend-Guard](https://github.com/PrashantAHD/spend-guard), developed by
+Prashant Kumar, to keep AI coding-agent work cost-effective without lowering safeguards:
+
+- **GPT-5.6 Luna** handles routine work such as tests, reinstallations, health checks, logs,
+  documentation and git.
+- Code changes go to a standard developer model.
+- Authentication, signing, Telegram approvals and buttons, session grants, the press guard,
+  `hook.py` and the VS Code extension receive an **Opus security review**.
+- The cost guard moves new tasks out of long chats, while automatic startup context restores a
+  capped local handoff and previous-chat digest without making another model call.
+
+The integration is maintained directly in this repository; Spend-Guard is not used to
+overwrite or manage Agent Doorbell source files.
+
 ## How it works
 
 ```mermaid
