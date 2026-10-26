@@ -33,3 +33,8 @@ you are, route every request yourself; the user does not pick agents:
 - Tests, reinstall, health checks, logs, docs, git: do it yourself.
 Give a subagent everything in one message (goal, files, expected behaviour); it does
 not see the conversation.
+
+## Long chats
+`.github/hooks/cost_guard.py` adds a "[Cost guard …]" note to your message once this
+chat passes ~100k tokens of context. Follow it: continue follow-ups here, but move a
+new task to a fresh chat with a short handoff.

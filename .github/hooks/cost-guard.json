@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "hooks": {
+    "userPromptTransformed": [
+      {
+        "type": "command",
+        "powershell": "python .github/hooks/cost_guard.py",
+        "bash": "python3 .github/hooks/cost_guard.py",
+        "timeoutSec": 10
+      }
+    ]
+  }
+}

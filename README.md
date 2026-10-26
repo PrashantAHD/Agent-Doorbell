@@ -422,6 +422,7 @@ Agent-Doorbell/
 ├── LICENSE              # MIT
 ├── AGENTS.md            # guide for coding agents working on this repo
 ├── .github/agents/      # cost-saving agents: cheap main agent, Sonnet developer, Opus security reviewer
+├── .github/hooks/       # cost guard: moves new tasks out of long chats
 └── tests/               # python -m unittest discover -s tests
 ```
 
