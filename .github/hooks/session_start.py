@@ -104,10 +104,17 @@ def main():
         if notes_path.exists():
             notes = "\n".join(notes_path.read_text(encoding="utf-8", errors="replace")
                                .splitlines()[-MAX_NOTES_LINES:])
+        graph = ""
+        graph_path = Path(cwd) / ".github" / "spend-guard-graph" / "GRAPH_REPORT.md"
+        if graph_path.exists():
+            graph = "\n".join(graph_path.read_text(encoding="utf-8", errors="replace")
+                              .splitlines()[:40])
         previous = _previous(home, current, cwd)
         context = "Spend-Guard startup context\n"
         if notes:
             context += "\nProject notes:\n" + notes
+        if graph:
+            context += "\n\nLocal code graph summary:\n" + graph
         if previous:
             context += "\n\n" + previous
         return json.dumps({"additionalContext": context[-MAX_CONTEXT:]}) if context.strip() else "{}"

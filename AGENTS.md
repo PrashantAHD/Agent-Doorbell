@@ -40,3 +40,6 @@ chat passes ~100k tokens of context. Follow it: continue follow-ups here, but mo
 new task to a fresh chat with a short handoff. New chats read `.github/notes.md` first;
 after each task, append 1-3 lines with a decision, current state, half-done work or a
 gotcha. Condense older entries around 60 lines. Never put secrets or client data there.
+For optional code context, run `python "%USERPROFILE%\.copilot\skills\spend-guard\spendguard.py" graph .`.
+It is local-only and excludes secret-looking files, symlinks, dependencies and large files; never
+point it at client data or generated logs.

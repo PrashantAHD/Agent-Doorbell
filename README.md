@@ -96,6 +96,9 @@ Prashant Kumar, to keep AI coding-agent work cost-effective without lowering saf
   `hook.py` and the VS Code extension receive an **Opus security review**.
 - The cost guard moves new tasks out of long chats, while automatic startup context restores a
   capped local handoff and previous-chat digest without making another model call.
+- An optional secure local code graph can add bounded symbol/import context using
+  `python "%USERPROFILE%\.copilot\skills\spend-guard\spendguard.py" graph .`; it makes no
+  model or network calls and excludes secret-looking files, symlinks, dependencies and large files.
 
 The integration is maintained directly in this repository; Spend-Guard is not used to
 overwrite or manage Agent Doorbell source files.
@@ -438,7 +441,7 @@ Agent-Doorbell/
 ├── LICENSE              # MIT
 ├── AGENTS.md            # guide for coding agents working on this repo
 ├── .github/agents/      # cost-saving agents: cheap main agent, Sonnet developer, Opus security reviewer
-├── .github/hooks/       # cost guard: moves new tasks out of long chats
+├── .github/hooks/       # cost guard and automatic startup context
 └── tests/               # python -m unittest discover -s tests
 ```
 
