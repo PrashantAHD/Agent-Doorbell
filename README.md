@@ -420,6 +420,8 @@ Agent-Doorbell/
 ├── uninstall.sh         # macOS/Linux: removes all of the above
 ├── requirements.txt     # truststore
 ├── LICENSE              # MIT
+├── AGENTS.md            # guide for coding agents working on this repo
+├── .github/agents/      # cost-saving agents: cheap main agent, Sonnet developer, Opus security reviewer
 └── tests/               # python -m unittest discover -s tests
 ```
 
