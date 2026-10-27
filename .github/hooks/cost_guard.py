@@ -10,7 +10,6 @@ Fails open: on any problem it prints {} and the message is left unchanged.
 
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -48,8 +47,9 @@ def note(tokens: int) -> str:
         f"\n\n[Cost guard: {urgency} (~{k}k tokens of history are resent with every request). "
         "Decide whether the request above is a NEW task or a follow-up to the current work. "
         "Follow-up: ignore this note and continue. "
-        "New task: do not start it here. Before moving, append a short durable handoff to "
-        ".github/notes.md (decision, current state or half-done work; never secrets or client data). "
+        "New task: do not start it here. Before moving, append a one-line summary to "
+        ".github/notes.md (decision, current state or half-done work, in your own words; never the "
+        "user's message verbatim, secrets or client data). "
         "If you have the create_session tool, call it with "
         f"model \"{DEFAULT_MODEL}\", this workspace, a short title, and a prompt containing a "
         "handoff (goal, key files, decisions and state that matter, max ~15 lines) followed by "
@@ -57,23 +57,6 @@ def note(tokens: int) -> str:
         "If you don't have that tool, tell the user in one line to start a new chat for it "
         "and give them a 3-line handoff to paste.]"
     )
-
-
-def append_handoff(data, tokens):
-    cwd = data.get("cwd") or data.get("workspace") or data.get("workspaceFolder")
-    if isinstance(cwd, dict):
-        cwd = cwd.get("cwd") or cwd.get("path")
-    prompt = data.get("transformedPrompt")
-    if not cwd or not isinstance(prompt, str) or not prompt.strip():
-        return
-    line = " ".join(prompt.strip().split())[:500]
-    if re.search(r"(^|[\\/])(?:config\.json|\.env(?:\b|[.]))", line, re.I):
-        return
-    path = Path(str(cwd)) / ".github" / "notes.md"
-    if not path.exists():
-        return
-    with path.open("a", encoding="utf-8", newline="\n") as f:
-        f.write(f"\n- Cost-guard handoff (~{tokens // 1000}k): {line}\n")
 
 
 def main() -> str:
@@ -85,7 +68,6 @@ def main() -> str:
     tokens = context_tokens(session_id)
     if tokens < SOFT_TOKENS:
         return "{}"
-    append_handoff(data, tokens)
     return json.dumps({"modifiedTransformedPrompt": content + note(tokens)})
 
 

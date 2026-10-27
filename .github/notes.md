@@ -9,3 +9,4 @@ Never put secrets or client data here.
 - Claude/Codex and macOS/Linux support remain; Telegram-only transport is intentional.
 - Question subtitles do not include session names.
 - Model routing uses Luna/Sonnet with an Opus reviewer; the cost guard moves new tasks to fresh chats.
+- Cost guard no longer auto-appends the raw prompt to notes.md; the agent writes a one-line summary itself.
