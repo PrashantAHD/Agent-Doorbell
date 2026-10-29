@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 420" role="img" aria-labelledby="title desc">
+  <title id="title">How Agent Doorbell works</title>
+  <desc id="desc">A looping diagram: the agent asks in VS Code first, the phone rings after 60 seconds if nobody answers, and the first Allow or Skip wins.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="960" y2="420" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B1220"/>
+      <stop offset="1" stop-color="#0B1F3A"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#1E293B"/>
+      <stop offset="1" stop-color="#0F172A"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="960" height="420" rx="28" fill="url(#bg)"/>
+  <text x="48" y="46" fill="#E2E8F0" font-family="Segoe UI, Arial, sans-serif" font-size="22" font-weight="700">Agent Doorbell in 12 seconds</text>
+  <text x="48" y="72" fill="#94A3B8" font-family="Segoe UI, Arial, sans-serif" font-size="14">Laptop first. Phone if nobody answers. First tap wins.</text>
+
+  <!-- agent -->
+  <g transform="translate(48,108)">
+    <rect width="210" height="86" rx="16" fill="#1E293B" stroke="#334155"/>
+    <text x="105" y="34" text-anchor="middle" fill="#94A3B8" font-family="Segoe UI, Arial, sans-serif" font-size="12">AGENT STOPS</text>
+    <text x="105" y="60" text-anchor="middle" fill="#F8FAFC" font-family="Segoe UI, Arial, sans-serif" font-size="16" font-weight="700">Run npm test?</text>
+  </g>
+
+  <path d="M270 151 H348" stroke="#334155" stroke-width="3" fill="none"/>
+  <circle r="9" fill="#38BDF8" filter="url(#glow)">
+    <animate attributeName="cx" values="270;360;520;270" keyTimes="0;0.28;0.62;1" dur="12s" repeatCount="indefinite"/>
+    <animate attributeName="cy" values="151;151;151;151" dur="12s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- vscode -->
+  <g transform="translate(360,108)">
+    <rect width="140" height="86" rx="16" fill="#0F172A" stroke="#38BDF8" stroke-width="2"/>
+    <text x="70" y="34" text-anchor="middle" fill="#7DD3FC" font-family="Segoe UI, Arial, sans-serif" font-size="12">VS CODE</text>
+    <text x="70" y="60" text-anchor="middle" fill="#F8FAFC" font-family="Segoe UI, Arial, sans-serif" font-size="15" font-weight="700" opacity="1">asks first
+      <animate attributeName="opacity" values="1;1;0;0;0;0;1" keyTimes="0;0.28;0.33;0.62;0.67;0.95;1" dur="12s" repeatCount="indefinite"/>
+    </text>
+    <text x="70" y="60" text-anchor="middle" fill="#FBBF24" font-family="Segoe UI, Arial, sans-serif" font-size="15" font-weight="700" opacity="0">60s wait
+      <animate attributeName="opacity" values="0;0;1;1;0;0;0" keyTimes="0;0.28;0.33;0.62;0.67;0.95;1" dur="12s" repeatCount="indefinite"/>
+    </text>
+    <text x="70" y="60" text-anchor="middle" fill="#86EFAC" font-family="Segoe UI, Arial, sans-serif" font-size="15" font-weight="700" opacity="0">carries on
+      <animate attributeName="opacity" values="0;0;0;0;1;1;0" keyTimes="0;0.28;0.33;0.62;0.67;0.95;1" dur="12s" repeatCount="indefinite"/>
+    </text>
+  </g>
+
+  <path d="M512 151 H548" stroke="#334155" stroke-width="3" fill="none"/>
+
+  <!-- phone -->
+  <g transform="translate(560,92)">
+    <rect width="352" height="118" rx="16" fill="url(#card)" stroke="#26A5E4" stroke-width="2"/>
+    <text x="24" y="32" fill="#7DD3FC" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">TELEGRAM</text>
+    <text x="24" y="58" fill="#E2E8F0" font-family="Segoe UI, Arial, sans-serif" font-size="16">billing-api · npm test --runInBand</text>
+    <g font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">
+      <rect x="24" y="74" width="88" height="28" rx="8" fill="#16A34A"/>
+      <text x="68" y="93" text-anchor="middle" fill="#F0FDF4">Allow</text>
+      <rect x="124" y="74" width="88" height="28" rx="8" fill="#334155"/>
+      <text x="168" y="93" text-anchor="middle" fill="#E2E8F0">Skip</text>
+    </g>
+    <circle cx="320" cy="32" r="10" fill="#F59E0B">
+      <animate attributeName="opacity" values="0;0;1;1;0.3;0.3;0" keyTimes="0;0.28;0.33;0.62;0.67;0.95;1" dur="12s" repeatCount="indefinite"/>
+    </circle>
+  </g>
+
+  <!-- caption -->
+  <text x="480" y="268" text-anchor="middle" fill="#94A3B8" font-family="Segoe UI, Arial, sans-serif" font-size="15">
+    <tspan opacity="1">1. Agent needs you. VS Code shows the usual prompt.
+      <animate attributeName="opacity" values="1;1;0;0;0;0;1" keyTimes="0;0.28;0.33;0.62;0.67;0.95;1" dur="12s" repeatCount="indefinite"/>
+    </tspan>
+  </text>
+  <text x="480" y="268" text-anchor="middle" fill="#FDE68A" font-family="Segoe UI, Arial, sans-serif" font-size="15" opacity="0">2. Still waiting after 60s? Your phone rings too.
+    <animate attributeName="opacity" values="0;0;1;1;0;0;0" keyTimes="0;0.28;0.33;0.62;0.67;0.95;1" dur="12s" repeatCount="indefinite"/>
+  </text>
+  <text x="480" y="268" text-anchor="middle" fill="#86EFAC" font-family="Segoe UI, Arial, sans-serif" font-size="15" opacity="0">3. Allow or Skip from either side. First answer wins.
+    <animate attributeName="opacity" values="0;0;0;0;1;1;0" keyTimes="0;0.28;0.33;0.62;0.67;0.95;1" dur="12s" repeatCount="indefinite"/>
+  </text>
+
+  <!-- three beats -->
+  <g font-family="Segoe UI, Arial, sans-serif">
+    <g transform="translate(48,300)">
+      <rect width="280" height="86" rx="14" fill="url(#card)" stroke="#38BDF8" stroke-width="1.5"/>
+      <text x="20" y="36" fill="#7DD3FC" font-size="12">LAPTOP</text>
+      <text x="20" y="62" fill="#F8FAFC" font-size="16" font-weight="700">VS Code asks first</text>
+    </g>
+    <g transform="translate(340,300)">
+      <rect width="280" height="86" rx="14" fill="url(#card)" stroke="#F59E0B" stroke-width="1.5"/>
+      <text x="20" y="36" fill="#FDE68A" font-size="12">PHONE</text>
+      <text x="20" y="62" fill="#F8FAFC" font-size="16" font-weight="700">rings after 60s</text>
+    </g>
+    <g transform="translate(632,300)">
+      <rect width="280" height="86" rx="14" fill="url(#card)" stroke="#22C55E" stroke-width="1.5"/>
+      <text x="20" y="36" fill="#86EFAC" font-size="12">SYNC</text>
+      <text x="20" y="62" fill="#F8FAFC" font-size="16" font-weight="700">first answer wins</text>
+    </g>
+  </g>
+</svg>

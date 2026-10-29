@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="t">
+  <title id="t">Agent Doorbell</title>
+  <defs>
+    <linearGradient id="g" x1="20" y1="8" x2="108" y2="120" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#38BDF8"/>
+      <stop offset="1" stop-color="#2563EB"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="#0F172A"/>
+  <path fill="url(#g)" d="M64 22c-18 0-32 14-32 32v18c0 6-4 12-10 16h84c-6-4-10-10-10-16V54c0-18-14-32-32-32z"/>
+  <path fill="#38BDF8" d="M48 96c4 10 24 10 28 0"/>
+  <circle cx="96" cy="32" r="12" fill="#F59E0B"/>
+</svg>
